@@ -95,4 +95,16 @@ class TranscriberClientHttpTest {
         assertTrue(r.networkFailure)
         assertNull(r.text)
     }
+
+    @Test fun `blocked cleartext is a config error not a network failure`() {
+        val original = TranscriberClient.client
+        TranscriberClient.client = original.newBuilder()
+            .connectionSpecs(listOf(okhttp3.ConnectionSpec.MODERN_TLS)) // like Android with cleartext disabled
+            .build()
+        try {
+            val r = transcribeBlocking(TranscriberClient.Config("http://127.0.0.1:9/v1", "k", "m"))
+            assertFalse(r.networkFailure)
+            assertNotNull(r.error)
+        } finally { TranscriberClient.client = original }
+    }
 }

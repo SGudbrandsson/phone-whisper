@@ -69,13 +69,25 @@ object TranscriberClient {
             .build()
     }
 
-    /** Starts the request. The returned [Call] can be cancelled; a cancelled call does not invoke [callback]. */
-    fun transcribe(wavData: ByteArray, config: Config, callback: (Result) -> Unit): Call {
+    /**
+     * Starts the request. [onCall] receives the [Call] before it is enqueued so the caller can
+     * cancel it; a cancelled call does not invoke [callback].
+     */
+    fun transcribe(
+        wavData: ByteArray,
+        config: Config,
+        onCall: (Call) -> Unit = {},
+        callback: (Result) -> Unit,
+    ): Call {
         val call = client.newCall(buildRequest(wavData, config))
+        onCall(call)
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 if (call.isCanceled()) return
-                callback(Result(null, e.message ?: e.javaClass.simpleName, networkFailure = true))
+                // UnknownServiceException = cleartext blocked / unsupported protocol: a config
+                // problem, not an unreachable server, so don't mask it with a fallback.
+                val reachability = e !is java.net.UnknownServiceException
+                callback(Result(null, e.message ?: e.javaClass.simpleName, networkFailure = reachability))
             }
 
             override fun onResponse(call: Call, response: Response) {

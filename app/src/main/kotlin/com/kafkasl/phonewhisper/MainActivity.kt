@@ -474,6 +474,9 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     promptText("Base URL, e.g. https://whisper.example.com/v1", settings.baseUrl, Endpoints.DEFAULT_BASE_URL) {
                         settings.baseUrl = Endpoints.normalizeBase(it)
+                        if (settings.baseUrl.startsWith("http://")) {
+                            toast("Unencrypted http — audio and API key are sent in the clear. Use only on a trusted network.")
+                        }
                     }
                 }
             }

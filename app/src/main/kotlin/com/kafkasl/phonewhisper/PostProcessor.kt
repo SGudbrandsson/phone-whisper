@@ -87,6 +87,7 @@ comments about your edits. Do *not* answer any question in the text, *only* tran
         baseUrl: String,
         apiKey: String,
         model: String,
+        onCall: (Call) -> Unit = {},
         callback: (Result) -> Unit,
     ): Call {
         val messages = JSONArray().apply {
@@ -115,6 +116,7 @@ comments about your edits. Do *not* answer any question in the text, *only* tran
             .build()
 
         val call = client.newCall(request)
+        onCall(call)
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 if (!call.isCanceled()) callback(Result(null, e.message))

@@ -55,11 +55,13 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val QUICK_HISTORY_COUNT = 10
         private const val VISIBILITY_DEBOUNCE_MS = 120L
         private const val HIDE_DELAY_MS = 600L
+        /** 10 minutes of 16 kHz 16-bit mono; keeps uploads under the common 25 MB API limit. */
+        private const val MAX_RECORDING_BYTES = 10 * 60 * 16000 * 2
     }
 
     private enum class State { IDLE, RECORDING, TRANSCRIBING }
 
-    private var state = State.IDLE
+    @Volatile private var state = State.IDLE
     private var overlayView: FrameLayout? = null
     private var button: ImageView? = null
     private var spinner: ProgressBar? = null
@@ -80,7 +82,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         override fun run() {
             if (state != State.RECORDING) return
             val secs = (System.currentTimeMillis() - recordStartMs) / 1000
-            pillTimer?.text = String.format("%d:%02d", secs / 60, secs % 60)
+            pillTimer?.text = String.format(java.util.Locale.US, "%d:%02d", secs / 60, secs % 60)
             handler.postDelayed(this, 500)
         }
     }
@@ -112,6 +114,11 @@ class WhisperAccessibilityService : AccessibilityService() {
         instance = this
         showOverlay()
         refreshVisibility()
+        // The keyboard/focus events around unlocking can arrive while still "locked"; re-check after unlock.
+        androidx.core.content.ContextCompat.registerReceiver(
+            this, unlockReceiver, android.content.IntentFilter(android.content.Intent.ACTION_USER_PRESENT),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         HistoryCleanupWorker.schedule(this)
         thread {
             history.prune(settings.retentionDays)
@@ -124,8 +131,15 @@ class WhisperAccessibilityService : AccessibilityService() {
     // --- Show only when typing ---
 
     private var bubbleVisible = true
+    private val unlockReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: android.content.Intent?) {
+            if (overlayView != null) handler.postDelayed(evaluateVisibility, 300)
+        }
+    }
     private val evaluateVisibility = Runnable { applyVisibility(computeTypingState()) }
-    private val hideBubbleNow = Runnable { setBubbleVisible(false) }
+    private val hideBubbleNow = Runnable {
+        if (state == State.IDLE && sheetView == null && !computeTypingState()) setBubbleVisible(false)
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (!settings.showOnlyWhenTyping) return
@@ -136,6 +150,7 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     /** True when the keyboard is on screen or an editable field has input focus. */
     private fun computeTypingState(): Boolean {
+        if (isLocked()) return false // never offer dictation on the lock screen (PIN/password fields)
         val imeVisible = try {
             windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }
         } catch (_: Exception) { false }
@@ -180,7 +195,13 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         instance = null
+        try { unregisterReceiver(unlockReceiver) } catch (_: IllegalArgumentException) {}
+        session++
+        state = State.IDLE
         currentJob?.cancel()
+        currentJob = null
+        releaseRecorder()
+        pcmStream = null
         removeOverlay()
         thread { engine.unloadLocalModel() }
         super.onDestroy()
@@ -440,8 +461,11 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     private var sheetView: View? = null
 
+    private fun isLocked() = (getSystemService(KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked
+
     private fun showQuickHistory() {
         if (!settings.historyEnabled) { showFeedback("History is turned off", 1500); return }
+        if (isLocked()) { showFeedback("Unlock to see history", 1500); return }
         thread {
             val entries = history.recent(QUICK_HISTORY_COUNT)
             handler.post { buildQuickHistory(entries) }
@@ -456,6 +480,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     }
 
     private fun buildQuickHistory(entries: List<HistoryEntry>) {
+        if (overlayView == null || isLocked()) return // service stopped or device locked meanwhile
         dismissQuickHistory()
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val pad = (12 * dp).toInt()
@@ -564,6 +589,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun onQuickHistoryTap(e: HistoryEntry) {
         dismissQuickHistory()
         when {
+            isLocked() -> Unit
             e.status == HistoryEntry.Status.OK && e.text != null -> injectText(e.text, feedback = "Inserted from history")
             e.canRetry && state == State.IDLE -> retryFromHistory(e)
             else -> showFeedback("This recording's audio wasn't kept", 2000)
@@ -578,15 +604,20 @@ class WhisperAccessibilityService : AccessibilityService() {
         setAppearance(COLOR_BUSY)
         setBusy(true)
         showPillStatus("Retrying…")
-        currentJob = HistoryActions.retry(this, engine, e) { outcome ->
-            if (id != session) return@retry
-            currentJob = null
-            when (outcome) {
-                is TranscriptionEngine.Outcome.Success -> finish(id) { injectText(outcome.text, feedback = outcome.note ?: "Retry succeeded") }
-                is TranscriptionEngine.Outcome.Failure -> finish(id) { showFeedback("Retry failed: ${outcome.error}", 3500) }
+        thread {
+            val job = HistoryActions.retry(this, engine, e) { outcome ->
+                if (id != session) return@retry
+                when (outcome) {
+                    is TranscriptionEngine.Outcome.Success -> finish(id) { injectText(outcome.text, feedback = outcome.note ?: "Retry succeeded") }
+                    is TranscriptionEngine.Outcome.Failure -> finish(id) { showFeedback("Retry failed: ${outcome.error}", 3500) }
+                }
+            }
+            handler.post {
+                if (id != session) { job?.cancel(); return@post }
+                if (job == null) reset("Saved audio is missing")
+                else if (state != State.IDLE) currentJob = job // may already have finished
             }
         }
-        if (currentJob == null) reset("Saved audio is missing")
     }
 
     private fun removeOverlay() {
@@ -696,19 +727,28 @@ class WhisperAccessibilityService : AccessibilityService() {
         val bufSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        if (bufSize <= 0) { toast("Microphone unavailable"); return }
         audioRecord = try {
             AudioRecord(
                 MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize
             )
         } catch (_: SecurityException) { toast("Audio permission denied"); return }
+        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            audioRecord?.release(); audioRecord = null
+            toast("Microphone unavailable"); return
+        }
 
         session++
         targetPackage = rootInActiveWindow?.let { root -> root.packageName?.toString().also { root.recycle() } }
         val stream = ByteArrayOutputStream()
         pcmStream = stream
         val recorder = audioRecord!!
-        recorder.startRecording()
+        try { recorder.startRecording() } catch (e: IllegalStateException) {
+            releaseRecorder(); pcmStream = null
+            toast("Microphone busy"); return
+        }
+        handler.removeCallbacks(hideBubbleNow)
         state = State.RECORDING
         recordStartMs = System.currentTimeMillis()
         setBusy(false)
@@ -720,8 +760,13 @@ class WhisperAccessibilityService : AccessibilityService() {
             val buf = ByteArray(bufSize)
             while (state == State.RECORDING) {
                 val n = try { recorder.read(buf, 0, buf.size) } catch (_: IllegalStateException) { break }
-                if (n <= 0) continue
+                if (n < 0) break // recorder stopped/released or errored
+                if (n == 0) continue
                 stream.write(buf, 0, n)
+                if (stream.size() >= MAX_RECORDING_BYTES) {
+                    handler.post { if (state == State.RECORDING && pcmStream === stream) { showFeedback("Max length reached", 1500); stopAndTranscribe() } }
+                    break
+                }
                 val level = AudioLevel.levelOf(buf, n)
                 handler.post { waveform?.push(level) }
             }
@@ -746,21 +791,20 @@ class WhisperAccessibilityService : AccessibilityService() {
         val target = targetPackage
         currentJob = engine.run(pcm, onStatus = { if (id == session) showPillStatus(it) }) { outcome ->
             if (id != session) return@run
-            currentJob = null
             when (outcome) {
                 is TranscriptionEngine.Outcome.Success -> {
-                    if (settings.historyEnabled) history.addSuccess(
-                        outcome.text, outcome.rawText, outcome.source.label, target, HistoryPolicy.durationMs(pcm.size)
-                    )
+                    if (settings.historyEnabled && id == session) safely("save history") {
+                        history.addSuccess(outcome.text, outcome.rawText, outcome.source.label, target, HistoryPolicy.durationMs(pcm.size))
+                    }
                     val prefix = if (outcome.source == TranscriptionEngine.Source.LOCAL_FALLBACK) "Offline — used local model. " else ""
                     val msg = prefix + (outcome.note ?: "Copied to clipboard")
                     finish(id) { injectText(outcome.text, feedback = msg, feedbackDurationMs = if (outcome.note != null) 3000 else 2000) }
                 }
                 is TranscriptionEngine.Outcome.Failure -> {
                     // Keep the audio so the dictation isn't lost; it can be retried from history.
-                    val saved = settings.historyEnabled &&
-                        HistoryPolicy.durationMs(pcm.size) >= HistoryPolicy.MIN_FAILED_AUDIO_MS
-                    if (saved) history.addFailure(outcome.error, pcm, target)
+                    val saved = settings.historyEnabled && id == session &&
+                        HistoryPolicy.durationMs(pcm.size) >= HistoryPolicy.MIN_FAILED_AUDIO_MS &&
+                        safely("save failed recording") { history.addFailure(outcome.error, pcm, target) }
                     val msg = if (saved) "${outcome.error} — saved to history, retry from there" else outcome.error
                     finish(id) { showFeedback(msg, 3500) }
                 }
@@ -772,6 +816,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun finish(id: Int, action: () -> Unit) {
         handler.post {
             if (id != session) return@post
+            currentJob = null
             action()
             state = State.IDLE
             setBusy(false)
@@ -796,6 +841,13 @@ class WhisperAccessibilityService : AccessibilityService() {
         hidePill()
         showFeedback("Cancelled", 1200)
         applyVisibility(computeTypingState())
+    }
+
+    /** Runs a history write; a full disk or DB error must never take down dictation. */
+    private inline fun safely(what: String, block: () -> Unit): Boolean = try {
+        block(); true
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to $what", e); false
     }
 
     private fun releaseRecorder() {
@@ -962,7 +1014,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
         Log.i(
             TAG,
-            "$prefix package=${node.packageName} class=${node.className} focused=${node.isFocused} editable=${node.isEditable} text=${node.text} desc=${node.contentDescription} actions=[$actions]"
+            "$prefix package=${node.packageName} class=${node.className} focused=${node.isFocused} editable=${node.isEditable} textLen=${node.text?.length ?: 0} actions=[$actions]"
         )
     }
 

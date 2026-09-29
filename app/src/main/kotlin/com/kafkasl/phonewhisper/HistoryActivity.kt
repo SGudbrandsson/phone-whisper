@@ -31,8 +31,10 @@ class HistoryActivity : AppCompatActivity() {
     private val onChange: () -> Unit = { handler.post { load() } }
 
     /** Uses the overlay service's engine when running, so a loaded local model is reused. */
+    private var ownEngine: TranscriptionEngine? = null
     private val engine: TranscriptionEngine by lazy {
-        WhisperAccessibilityService.instance?.engine ?: TranscriptionEngine(applicationContext)
+        WhisperAccessibilityService.instance?.engine
+            ?: TranscriptionEngine(applicationContext).also { ownEngine = it }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -97,6 +99,12 @@ class HistoryActivity : AppCompatActivity() {
     override fun onStop() {
         HistoryStore.removeListener(onChange)
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        // Free a local model this screen loaded itself (the service's engine is left alone).
+        ownEngine?.let { e -> thread { e.unloadLocalModel() } }
+        super.onDestroy()
     }
 
     private fun load() {

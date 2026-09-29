@@ -11,7 +11,7 @@ enum class TranscriptionMode(val key: String, val label: String, val description
         "Uses the cloud endpoint; falls back to the local model when there is no network"
     ),
     CLOUD_ONLY("cloud", "Cloud only", "Always uses the cloud endpoint"),
-    LOCAL_ONLY("local", "Local only", "Audio never leaves the device");
+    LOCAL_ONLY("local", "Local only", "Audio never leaves the device (cleanup, if on, still sends the text)");
 
     companion object {
         fun fromKey(key: String?): TranscriptionMode? = values().firstOrNull { it.key == key }

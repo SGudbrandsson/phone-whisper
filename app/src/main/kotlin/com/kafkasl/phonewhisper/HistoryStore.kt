@@ -210,6 +210,7 @@ object HistoryActions {
      * Re-transcribes a failed entry from its saved audio using the normal cloud/fallback path.
      * On success the entry is updated and its audio deleted; on failure the new error is stored.
      * [done] runs on a background thread. Returns null if the entry has no audio to retry.
+     * Reads the audio file, so call off the main thread.
      */
     fun retry(
         ctx: Context,
@@ -226,12 +227,16 @@ object HistoryActions {
             return null
         }
         return engine.run(pcm) { outcome ->
-            when (outcome) {
-                is TranscriptionEngine.Outcome.Success ->
-                    store.markRetried(entry.id, outcome.text, outcome.rawText, outcome.source.label)
-                is TranscriptionEngine.Outcome.Failure -> store.updateError(entry.id, outcome.error)
+            try {
+                when (outcome) {
+                    is TranscriptionEngine.Outcome.Success ->
+                        store.markRetried(entry.id, outcome.text, outcome.rawText, outcome.source.label)
+                    is TranscriptionEngine.Outcome.Failure -> store.updateError(entry.id, outcome.error)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("HistoryActions", "Could not update history entry", e)
             }
-            done(outcome)
+            done(outcome) // always report back, even if the history update failed
         }
     }
 

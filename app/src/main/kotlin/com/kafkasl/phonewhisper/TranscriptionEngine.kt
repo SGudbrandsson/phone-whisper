@@ -39,20 +39,34 @@ class TranscriptionEngine(private val ctx: Context) {
      */
     fun run(pcm: ByteArray, onStatus: (String) -> Unit = {}, done: (Outcome) -> Unit): Job {
         val job = Job()
-        val finish: (Outcome) -> Unit = { if (!job.cancelled) done(it) }
+        val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
+        val finish: (Outcome) -> Unit = { outcome ->
+            if (!job.cancelled && delivered.compareAndSet(false, true)) {
+                try { done(outcome) } catch (e: Exception) { Log.e(TAG, "Outcome handler failed", e) }
+            }
+        }
 
-        val plan = TranscriptionRouter.plan(
-            mode = settings.mode,
-            online = Connectivity.isOnline(ctx),
-            hasApiKey = settings.hasApiKey,
-            hasLocalModel = hasLocalModel(),
-            baseUrl = settings.baseUrl,
-        )
-        Log.i(TAG, "Transcription plan: $plan")
-        when (plan) {
-            is TranscriptionRouter.Plan.Cloud -> runCloud(pcm, plan.fallbackToLocal, job, onStatus, finish)
-            TranscriptionRouter.Plan.Local -> runLocal(pcm, Source.LOCAL, job, finish)
-            is TranscriptionRouter.Plan.Unavailable -> thread { finish(Outcome.Failure(plan.reason)) }
+        // Planning touches the Keystore and disk, so keep it off the caller's (main) thread.
+        thread {
+            try {
+                val plan = TranscriptionRouter.plan(
+                    mode = settings.mode,
+                    online = Connectivity.isOnline(ctx),
+                    hasApiKey = settings.hasApiKey,
+                    hasLocalModel = hasLocalModel(),
+                    baseUrl = settings.baseUrl,
+                )
+                Log.i(TAG, "Transcription plan: $plan")
+                if (job.cancelled) return@thread
+                when (plan) {
+                    is TranscriptionRouter.Plan.Cloud -> runCloud(pcm, plan.fallbackToLocal, job, onStatus, finish)
+                    TranscriptionRouter.Plan.Local -> runLocal(pcm, Source.LOCAL, job, finish)
+                    is TranscriptionRouter.Plan.Unavailable -> finish(Outcome.Failure(plan.reason))
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Transcription failed to start", e)
+                finish(Outcome.Failure(e.message ?: "Transcription failed"))
+            }
         }
         return job
     }
@@ -61,7 +75,7 @@ class TranscriptionEngine(private val ctx: Context) {
         pcm: ByteArray, fallbackToLocal: Boolean, job: Job,
         onStatus: (String) -> Unit, finish: (Outcome) -> Unit,
     ) {
-        job.call = TranscriberClient.transcribe(WavWriter.encode(pcm), settings.cloudConfig()) { result ->
+        TranscriberClient.transcribe(WavWriter.encode(pcm), settings.cloudConfig(), onCall = { job.call = it; if (job.cancelled) it.cancel() }) { result ->
             job.call = null
             when {
                 job.cancelled -> Unit
@@ -80,12 +94,15 @@ class TranscriptionEngine(private val ctx: Context) {
     private fun runLocal(pcm: ByteArray, source: Source, job: Job, finish: (Outcome) -> Unit) {
         thread {
             try {
-                val model = obtainLocalModel()
-                    ?: return@thread finish(Outcome.Failure("Local model could not be loaded"))
-                if (job.cancelled) return@thread
                 val samples = pcmToFloat(pcm)
                 val t0 = System.currentTimeMillis()
-                val text = model.transcribe(samples, SAMPLE_RATE)
+                val text = try {
+                    transcribeWithLocalModel(samples) ?: return@thread finish(Outcome.Failure("Local model could not be loaded"))
+                } catch (_: IllegalStateException) {
+                    // The model was swapped (settings change) mid-decode; load the new one and retry once.
+                    if (job.cancelled) return@thread
+                    transcribeWithLocalModel(samples) ?: return@thread finish(Outcome.Failure("Local model could not be loaded"))
+                }
                 Log.i(TAG, "Local transcription: ${System.currentTimeMillis() - t0}ms, ${samples.size / SAMPLE_RATE}s audio")
                 if (text.isBlank()) finish(Outcome.Failure("No speech detected"))
                 else cleanup(text, source, job, finish)
@@ -95,6 +112,9 @@ class TranscriptionEngine(private val ctx: Context) {
             }
         }
     }
+
+    private fun transcribeWithLocalModel(samples: FloatArray): String? =
+        obtainLocalModel()?.transcribe(samples, SAMPLE_RATE)
 
     private fun cleanup(text: String, source: Source, job: Job, finish: (Outcome) -> Unit) {
         if (!settings.usePostProcessing) return finish(Outcome.Success(text, text, source, null))
@@ -106,8 +126,10 @@ class TranscriptionEngine(private val ctx: Context) {
         if (!online) return finish(Outcome.Success(text, text, source, "Cleanup skipped (offline)"))
         if (keyMissing) return finish(Outcome.Success(text, text, source, "Cleanup needs an API key"))
 
-        job.call = PostProcessor.process(
-            text, settings.postProcessingPrompt, settings.baseUrl, settings.apiKey, settings.chatModel
+        if (job.cancelled) return
+        PostProcessor.process(
+            text, settings.postProcessingPrompt, settings.baseUrl, settings.apiKey, settings.chatModel,
+            onCall = { job.call = it; if (job.cancelled) it.cancel() },
         ) { result ->
             job.call = null
             if (job.cancelled) return@process
