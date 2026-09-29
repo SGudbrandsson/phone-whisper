@@ -47,6 +47,11 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val COLOR_BUSY = 0xDD6B6B6B.toInt()
         private const val COLOR_FEEDBACK_BG = 0xEE1C1C1E.toInt()
         private const val COLOR_RING = 0xFFE8EAED.toInt()
+        private const val COLOR_PILL_BG = 0xEE1C1C1E.toInt()
+        private const val COLOR_CANCEL = 0xFF3A3A3C.toInt()
+        private const val COLOR_STOP = 0xFFEF4444.toInt()
+        private const val PILL_W_DP = 216
+        private const val PILL_GAP_DP = 6
     }
 
     private enum class State { IDLE, RECORDING, TRANSCRIBING }
@@ -58,6 +63,24 @@ class WhisperAccessibilityService : AccessibilityService() {
     private var feedbackView: TextView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
     private var feedbackLayoutParams: WindowManager.LayoutParams? = null
+
+    // Recording pill: [✕] waveform/status timer [✓], shown beside the bubble while busy.
+    private var pillView: android.widget.LinearLayout? = null
+    private var pillParams: WindowManager.LayoutParams? = null
+    private var pillShown = false
+    private var waveform: WaveformView? = null
+    private var pillStatus: TextView? = null
+    private var pillTimer: TextView? = null
+    private var pillStop: TextView? = null
+    private var recordStartMs = 0L
+    private val tickTimer = object : Runnable {
+        override fun run() {
+            if (state != State.RECORDING) return
+            val secs = (System.currentTimeMillis() - recordStartMs) / 1000
+            pillTimer?.text = String.format("%d:%02d", secs / 60, secs % 60)
+            handler.postDelayed(this, 500)
+        }
+    }
     private var audioRecord: AudioRecord? = null
     private var pcmStream: ByteArrayOutputStream? = null
     private val handler = Handler(Looper.getMainLooper())
@@ -184,6 +207,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                         positionFeedback(it, params)
                         wm.updateViewLayout(feedbackView, it)
                     }
+                    updatePillPosition()
                     true
                 }
                 MotionEvent.ACTION_UP -> {
@@ -198,6 +222,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                             positionFeedback(it, params)
                             wm.updateViewLayout(feedbackView, it)
                         }
+                        updatePillPosition()
                     }
                     true
                 }
@@ -233,6 +258,122 @@ class WhisperAccessibilityService : AccessibilityService() {
         feedbackView = feedback
         layoutParams = params
         feedbackLayoutParams = feedbackParams
+        buildPill(ringSize)
+    }
+
+    private fun buildPill(height: Int) {
+        val btn = (34 * dp).toInt()
+        fun roundButton(label: String, color: Int, desc: String, onClick: () -> Unit) = TextView(this).apply {
+            text = label
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(0xFFFFFFFF.toInt())
+            background = circle(color)
+            contentDescription = desc
+            setOnClickListener { onClick() }
+            layoutParams = android.widget.LinearLayout.LayoutParams(btn, btn)
+        }
+
+        val cancel = roundButton("✕", COLOR_CANCEL, "Cancel dictation") { cancelDictation() }
+        val stop = roundButton("✓", COLOR_STOP, "Stop and transcribe") { if (state == State.RECORDING) stopAndTranscribe() }
+
+        val wave = WaveformView(this).apply {
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, (22 * dp).toInt(), 1f).apply {
+                marginStart = (8 * dp).toInt(); marginEnd = (6 * dp).toInt()
+            }
+        }
+        val status = TextView(this).apply {
+            textSize = 13f
+            setTextColor(0xFFFFFFFF.toInt())
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            visibility = View.GONE
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = (10 * dp).toInt(); marginEnd = (6 * dp).toInt()
+            }
+        }
+        val timer = TextView(this).apply {
+            textSize = 12f
+            setTextColor(0xBBFFFFFF.toInt())
+            typeface = android.graphics.Typeface.MONOSPACE
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = (8 * dp).toInt() }
+        }
+
+        val pad = ((height - btn) / 2)
+        val pill = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(pad, pad, pad, pad)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = height / 2f
+                setColor(COLOR_PILL_BG)
+            }
+            addView(cancel); addView(wave); addView(status); addView(timer); addView(stop)
+        }
+
+        pillParams = WindowManager.LayoutParams(
+            (PILL_W_DP * dp).toInt(), height,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        pillView = pill; waveform = wave; pillStatus = status; pillTimer = timer; pillStop = stop
+    }
+
+    /** Places the pill on whichever side of the bubble has room. */
+    private fun updatePillPosition() {
+        val pill = pillView ?: return
+        val pp = pillParams ?: return
+        val bp = layoutParams ?: return
+        val gap = (PILL_GAP_DP * dp).toInt()
+        val bubbleW = bp.width
+        val onRight = bp.x + bubbleW / 2 > screenW / 2
+        pp.x = if (onRight) bp.x - pp.width - gap else bp.x + bubbleW + gap
+        pp.x = pp.x.coerceIn(0, maxOf(0, screenW - pp.width))
+        pp.y = bp.y
+        if (pillShown) (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(pill, pp)
+    }
+
+    private fun showPillRecording() = handler.post {
+        waveform?.clear()
+        waveform?.visibility = View.VISIBLE
+        pillStatus?.visibility = View.GONE
+        pillStop?.visibility = View.VISIBLE
+        pillTimer?.visibility = View.VISIBLE
+        pillTimer?.text = "0:00"
+        attachPill()
+        handler.removeCallbacks(tickTimer)
+        handler.post(tickTimer)
+    }
+
+    private fun showPillStatus(text: String) = handler.post {
+        waveform?.visibility = View.GONE
+        pillStatus?.text = text
+        pillStatus?.visibility = View.VISIBLE
+        pillStop?.visibility = View.GONE
+        pillTimer?.visibility = View.GONE
+        attachPill()
+    }
+
+    private fun attachPill() {
+        val pill = pillView ?: return
+        if (!pillShown) {
+            pillShown = true
+            updatePillPosition()
+            (getSystemService(WINDOW_SERVICE) as WindowManager).addView(pill, pillParams)
+        }
+    }
+
+    private fun hidePill() = handler.post {
+        handler.removeCallbacks(tickTimer)
+        val pill = pillView ?: return@post
+        if (pillShown) {
+            pillShown = false
+            (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(pill)
+        }
     }
 
     private fun removeOverlay() {
@@ -245,6 +386,10 @@ class WhisperAccessibilityService : AccessibilityService() {
             wm.removeView(it)
             feedbackView = null
         }
+        handler.removeCallbacks(tickTimer)
+        if (pillShown) pillView?.let { wm.removeView(it) }
+        pillShown = false
+        pillView = null
         button = null
         spinner = null
         layoutParams = null
@@ -343,18 +488,25 @@ class WhisperAccessibilityService : AccessibilityService() {
         } catch (_: SecurityException) { toast("Audio permission denied"); return }
 
         session++
-        pcmStream = ByteArrayOutputStream()
-        audioRecord!!.startRecording()
+        val stream = ByteArrayOutputStream()
+        pcmStream = stream
+        val recorder = audioRecord!!
+        recorder.startRecording()
         state = State.RECORDING
+        recordStartMs = System.currentTimeMillis()
         setBusy(false)
         setAppearance(COLOR_RECORDING)
         startPulse()
+        showPillRecording()
 
         thread {
             val buf = ByteArray(bufSize)
             while (state == State.RECORDING) {
-                val n = audioRecord?.read(buf, 0, buf.size) ?: break
-                if (n > 0) pcmStream?.write(buf, 0, n)
+                val n = try { recorder.read(buf, 0, buf.size) } catch (_: IllegalStateException) { break }
+                if (n <= 0) continue
+                stream.write(buf, 0, n)
+                val level = AudioLevel.levelOf(buf, n)
+                handler.post { waveform?.push(level) }
             }
         }
     }
@@ -367,14 +519,13 @@ class WhisperAccessibilityService : AccessibilityService() {
         setAppearance(COLOR_BUSY)
         setBusy(true)
 
-        audioRecord?.stop()
-        audioRecord?.release()
-        audioRecord = null
+        releaseRecorder()
 
         val pcm = pcmStream?.toByteArray() ?: ByteArray(0)
         pcmStream = null
 
         if (pcm.isEmpty()) { reset("No audio captured"); return }
+        showPillStatus("Transcribing…")
 
         val plan = TranscriptionRouter.plan(
             mode = settings.mode,
@@ -401,6 +552,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 !result.text.isNullOrBlank() -> handleTranscriptionResult(result.text, Source.CLOUD, id)
                 result.networkFailure && fallbackToLocal -> {
                     Log.i(TAG, "Cloud unreachable (${result.error}); falling back to local")
+                    showPillStatus("Offline — local model…")
                     transcribeLocal(pcm, Source.LOCAL_FALLBACK, id)
                 }
                 else -> finishWithError("Error: ${result.error ?: "empty transcript"}", id)
@@ -480,7 +632,31 @@ class WhisperAccessibilityService : AccessibilityService() {
             state = State.IDLE
             setBusy(false)
             setAppearance(COLOR_IDLE)
+            hidePill()
         }
+    }
+
+    /** Discards the current recording or transcription. Nothing is typed or copied. */
+    private fun cancelDictation() {
+        if (state == State.IDLE) return
+        session++ // late results from the cancelled session are ignored
+        currentCall?.cancel()
+        currentCall = null
+        state = State.IDLE
+        releaseRecorder()
+        pcmStream = null
+        stopPulse()
+        setBusy(false)
+        setAppearance(COLOR_IDLE)
+        hidePill()
+        showFeedback("Cancelled", 1200)
+    }
+
+    private fun releaseRecorder() {
+        val r = audioRecord ?: return
+        audioRecord = null
+        try { r.stop() } catch (_: IllegalStateException) {}
+        r.release()
     }
 
     private fun finishWithError(msg: String, id: Int) = finish(id) { toast(msg) }
@@ -490,6 +666,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         state = State.IDLE
         setBusy(false)
         setAppearance(COLOR_IDLE)
+        hidePill()
     }
 
     // --- Text injection ---
