@@ -23,6 +23,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".HistoryActivity"
+            android:exported="false"
+            android:label="History"
+            android:excludeFromRecents="false" />
+
         <service
             android:name=".WhisperAccessibilityService"
             android:exported="false"

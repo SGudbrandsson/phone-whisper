@@ -78,6 +78,15 @@ class AppSettings(private val ctx: Context) {
         get() = prefs.getString("model_name", "") ?: ""
         set(value) { prefs.edit().putString("model_name", value).apply() }
 
+    var historyEnabled: Boolean
+        get() = prefs.getBoolean(KEY_HISTORY_ENABLED, true)
+        set(value) { prefs.edit().putBoolean(KEY_HISTORY_ENABLED, value).apply() }
+
+    /** Days to keep history; 0 keeps it forever. */
+    var retentionDays: Int
+        get() = prefs.getInt(KEY_RETENTION_DAYS, HistoryPolicy.DEFAULT_RETENTION_DAYS)
+        set(value) { prefs.edit().putInt(KEY_RETENTION_DAYS, value).apply() }
+
     fun cloudConfig() = TranscriberClient.Config(baseUrl, apiKey, sttModel, language)
 
     companion object {
@@ -91,6 +100,8 @@ class AppSettings(private val ctx: Context) {
         private const val KEY_LANGUAGE = "language"
         private const val KEY_CHAT_MODEL = "chat_model"
         private const val KEY_API_KEY_ENC = "api_key_enc"
+        private const val KEY_HISTORY_ENABLED = "history_enabled"
+        private const val KEY_RETENTION_DAYS = "history_retention_days"
         private const val LEGACY_USE_LOCAL = "use_local"
         private const val LEGACY_API_KEY = "api_key"
     }

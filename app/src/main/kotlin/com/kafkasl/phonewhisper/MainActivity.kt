@@ -34,6 +34,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var languageRowSub: TextView
     private lateinit var chatModelRowSub: TextView
     private lateinit var cloudContainer: LinearLayout
+    private lateinit var retentionRowSub: TextView
+    private lateinit var historySwitch: MaterialSwitch
+    private lateinit var historyDetails: LinearLayout
     private val settings by lazy { AppSettings(this) }
     private lateinit var promptRowSub: TextView
     private lateinit var promptRow: LinearLayout
@@ -89,6 +92,33 @@ class MainActivity : AppCompatActivity() {
         }
         accRowSub = accRow.findViewWithTag("subtitle")
         root.addView(accRow)
+
+        // --- History Section ---
+        root.addView(sectionHeader("History"))
+        root.addView(settingsRow("View history", "Copy past dictations, retry failed ones. Tip: long-press the bubble for recent ones.") {
+            startActivity(Intent(this, HistoryActivity::class.java))
+        })
+        historySwitch = MaterialSwitch(this).apply { isChecked = settings.historyEnabled; isClickable = false }
+        root.addView(settingsRow("Save history", "Transcripts, plus audio of failed dictations for retry", historySwitch) {
+            settings.historyEnabled = !settings.historyEnabled
+            historySwitch.isChecked = settings.historyEnabled
+            refresh()
+        })
+        historyDetails = vertical(0)
+        val retentionRow = settingsRow("Auto-clear", "") { chooseRetention() }
+        retentionRowSub = retentionRow.findViewWithTag("subtitle")
+        historyDetails.addView(retentionRow)
+        historyDetails.addView(settingsRow("Clear history now", "Deletes all transcripts and saved audio") {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Clear all history?")
+                .setPositiveButton("Clear") { _, _ ->
+                    Thread { HistoryStore.get(this).clearAll() }.start()
+                    toast("History cleared")
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        })
+        root.addView(historyDetails)
 
         // --- Engine Section ---
         root.addView(sectionHeader("Transcription"))
@@ -167,7 +197,8 @@ class MainActivity : AppCompatActivity() {
         if (!hasPerm(Manifest.permission.RECORD_AUDIO)) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
         }
-        
+
+        HistoryCleanupWorker.schedule(this)
         refresh()
     }
 
@@ -347,6 +378,8 @@ class MainActivity : AppCompatActivity() {
                          else "••••${apiKey.takeLast(4)} (stored encrypted)"
         baseUrlRowSub.text = "${serviceName(settings.baseUrl)} · ${settings.baseUrl}"
         sttModelRowSub.text = settings.sttModel
+        retentionRowSub.text = HistoryPolicy.label(settings.retentionDays)
+        historyDetails.visibility = if (settings.historyEnabled) View.VISIBLE else View.GONE
         languageRowSub.text = settings.language.ifBlank { "Auto-detect" }
         chatModelRowSub.text = settings.chatModel
 
@@ -437,6 +470,20 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
+            .show()
+    }
+
+    private fun chooseRetention() {
+        val choices = HistoryPolicy.RETENTION_CHOICES
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Auto-clear history")
+            .setSingleChoiceItems(choices.map { HistoryPolicy.label(it) }.toTypedArray(), choices.indexOf(settings.retentionDays)) { d, i ->
+                settings.retentionDays = choices[i]
+                Thread { HistoryStore.get(this).prune(settings.retentionDays) }.start()
+                d.dismiss()
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
             .show()
     }
 

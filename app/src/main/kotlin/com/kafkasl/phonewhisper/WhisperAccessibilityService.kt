@@ -52,6 +52,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val COLOR_STOP = 0xFFEF4444.toInt()
         private const val PILL_W_DP = 216
         private const val PILL_GAP_DP = 6
+        private const val QUICK_HISTORY_COUNT = 10
     }
 
     private enum class State { IDLE, RECORDING, TRANSCRIBING }
@@ -90,16 +91,16 @@ class WhisperAccessibilityService : AccessibilityService() {
         }?.start()
     }
 
-    // Local transcription engine. Loaded eagerly in local-only mode, otherwise on first use.
-    @Volatile private var localTranscriber: LocalTranscriber? = null
-    private val modelLock = Any()
-
     private val settings by lazy { AppSettings(this) }
+    /** Shared so the history screen can retry with the already-loaded local model. */
+    val engine by lazy { TranscriptionEngine(this) }
+    private val history by lazy { HistoryStore.get(this) }
 
     // Increments on every new recording and on cancel, so late results from an
     // abandoned session are dropped instead of being typed into the wrong place.
     @Volatile private var session = 0
-    private var currentCall: okhttp3.Call? = null
+    private var currentJob: TranscriptionEngine.Job? = null
+    private var targetPackage: String? = null
 
     private val dp get() = resources.displayMetrics.density
     private val screenW get() = resources.displayMetrics.widthPixels
@@ -108,9 +109,13 @@ class WhisperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         instance = this
         showOverlay()
-        // In local-only mode, load the model now so the first dictation is fast.
-        // Otherwise it is loaded only when a fallback actually needs it.
-        if (settings.mode == TranscriptionMode.LOCAL_ONLY) thread { obtainLocalModel() }
+        HistoryCleanupWorker.schedule(this)
+        thread {
+            history.prune(settings.retentionDays)
+            // In local-only mode, load the model now so the first dictation is fast.
+            // Otherwise it is loaded only when a fallback actually needs it.
+            if (settings.mode == TranscriptionMode.LOCAL_ONLY) engine.obtainLocalModel()
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -118,36 +123,17 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         instance = null
-        currentCall?.cancel()
+        currentJob?.cancel()
         removeOverlay()
-        thread { unloadLocalModel() }
+        thread { engine.unloadLocalModel() }
         super.onDestroy()
     }
-
-    /** Returns the loaded local model, loading it if needed. Blocking; call off the main thread. */
-    private fun obtainLocalModel(): LocalTranscriber? = synchronized(modelLock) {
-        val available = LocalTranscriber.availableModels(this)
-        val wanted = settings.modelName.takeIf { it in available } ?: available.firstOrNull() ?: return null
-        localTranscriber?.let { if (it.modelName == wanted) return it; it.release() }
-        localTranscriber = null
-        val t0 = System.currentTimeMillis()
-        localTranscriber = LocalTranscriber.create(this, wanted)
-        Log.i(TAG, "Loaded local model $wanted in ${System.currentTimeMillis() - t0}ms")
-        localTranscriber
-    }
-
-    private fun unloadLocalModel() = synchronized(modelLock) {
-        localTranscriber?.release()
-        localTranscriber = null
-    }
-
-    private fun hasLocalModel() = LocalTranscriber.availableModels(this).isNotEmpty()
 
     /** Called from MainActivity when the model or mode changes. */
     fun reloadModel() {
         thread {
-            unloadLocalModel()
-            if (settings.mode == TranscriptionMode.LOCAL_ONLY) obtainLocalModel()
+            engine.unloadLocalModel()
+            if (settings.mode == TranscriptionMode.LOCAL_ONLY) engine.obtainLocalModel()
         }
     }
 
@@ -191,15 +177,29 @@ class WhisperAccessibilityService : AccessibilityService() {
 
         var startX = 0; var startY = 0
         var touchX = 0f; var touchY = 0f
+        var longPressed = false
+        val longPress = Runnable {
+            if (state == State.IDLE) {
+                longPressed = true
+                overlay.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                showQuickHistory()
+            }
+        }
 
         overlay.setOnTouchListener { v, ev ->
             when (ev.action) {
                 MotionEvent.ACTION_DOWN -> {
                     startX = params.x; startY = params.y
                     touchX = ev.rawX; touchY = ev.rawY
+                    longPressed = false
+                    handler.postDelayed(longPress, android.view.ViewConfiguration.getLongPressTimeout().toLong())
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (abs(ev.rawX - touchX) + abs(ev.rawY - touchY) >= TAP_THRESHOLD_DP * dp) {
+                        handler.removeCallbacks(longPress)
+                    }
+                    if (longPressed) return@setOnTouchListener true
                     params.x = startX + (ev.rawX - touchX).toInt()
                     params.y = startY + (ev.rawY - touchY).toInt()
                     wm.updateViewLayout(v, params)
@@ -211,6 +211,8 @@ class WhisperAccessibilityService : AccessibilityService() {
                     true
                 }
                 MotionEvent.ACTION_UP -> {
+                    handler.removeCallbacks(longPress)
+                    if (longPressed) return@setOnTouchListener true
                     val moved = abs(ev.rawX - touchX) + abs(ev.rawY - touchY)
                     if (moved < TAP_THRESHOLD_DP * dp) {
                         onTap()
@@ -226,6 +228,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     }
                     true
                 }
+                MotionEvent.ACTION_CANCEL -> { handler.removeCallbacks(longPress); true }
                 else -> false
             }
         }
@@ -376,7 +379,159 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
     }
 
+    // --- Quick history (long-press the bubble) ---
+
+    private var sheetView: View? = null
+
+    private fun showQuickHistory() {
+        if (!settings.historyEnabled) { showFeedback("History is turned off", 1500); return }
+        thread {
+            val entries = history.recent(QUICK_HISTORY_COUNT)
+            handler.post { buildQuickHistory(entries) }
+        }
+    }
+
+    private fun dismissQuickHistory() {
+        sheetView?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
+        sheetView = null
+    }
+
+    private fun buildQuickHistory(entries: List<HistoryEntry>) {
+        dismissQuickHistory()
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val pad = (12 * dp).toInt()
+        val white = 0xFFFFFFFF.toInt()
+        val dim = 0x99FFFFFF.toInt()
+
+        val list = android.widget.LinearLayout(this).apply { orientation = android.widget.LinearLayout.VERTICAL }
+
+        val header = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(pad, pad, pad / 2, pad / 2)
+            addView(TextView(context).apply {
+                text = "Recent dictations"
+                textSize = 14f
+                setTextColor(white)
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(TextView(context).apply {
+                text = "All"
+                textSize = 14f
+                setTextColor(0xFF8AB4F8.toInt())
+                setPadding(pad, pad / 2, pad, pad / 2)
+                setOnClickListener {
+                    dismissQuickHistory()
+                    startActivity(android.content.Intent(context, HistoryActivity::class.java)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            })
+            addView(TextView(context).apply {
+                text = "✕"
+                textSize = 16f
+                setTextColor(white)
+                setPadding(pad, pad / 2, pad / 2, pad / 2)
+                contentDescription = "Close"
+                setOnClickListener { dismissQuickHistory() }
+            })
+        }
+
+        if (entries.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "Nothing yet. Your dictations will show up here."
+                setTextColor(dim)
+                textSize = 13f
+                setPadding(pad, pad, pad, pad * 2)
+            })
+        }
+        for (e in entries) {
+            val failed = e.status == HistoryEntry.Status.FAILED
+            list.addView(android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setPadding(pad, pad / 2 + pad / 4, pad, pad / 2 + pad / 4)
+                val outValue = android.util.TypedValue()
+                context.theme.resolveAttribute(android.R.attr.selectableItemBackground, outValue, true)
+                setBackgroundResource(outValue.resourceId)
+                addView(TextView(context).apply {
+                    text = if (failed) "Failed: ${e.error ?: "unknown error"}" else e.text
+                    textSize = 14f
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setTextColor(if (failed) 0xFFFF8A80.toInt() else white)
+                })
+                addView(TextView(context).apply {
+                    val action = if (failed) (if (e.canRetry) "Tap to retry" else "Audio not saved") else "Tap to insert"
+                    text = "${HistoryActions.relativeTime(e.createdAt)} · $action"
+                    textSize = 11f
+                    setTextColor(dim)
+                })
+                setOnClickListener { onQuickHistoryTap(e) }
+            })
+        }
+
+        val scroll = android.widget.ScrollView(this).apply { addView(list) }
+        val sheet = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            background = pill(COLOR_PILL_BG)
+            addView(header)
+            addView(scroll)
+            setOnTouchListener { _, ev ->
+                if (ev.action == MotionEvent.ACTION_OUTSIDE) { dismissQuickHistory(); true } else false
+            }
+        }
+
+        val width = minOf((320 * dp).toInt(), screenW - (2 * MARGIN_DP * dp).toInt())
+        sheet.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val height = minOf(sheet.measuredHeight, (380 * dp).toInt())
+        val bp = layoutParams
+        val params = WindowManager.LayoutParams(
+            width, height,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (screenW - width) / 2
+            y = ((bp?.y ?: screenH / 2) - height / 2).coerceIn((24 * dp).toInt(), maxOf(0, screenH - height - (24 * dp).toInt()))
+        }
+        wm.addView(sheet, params)
+        sheetView = sheet
+    }
+
+    private fun onQuickHistoryTap(e: HistoryEntry) {
+        dismissQuickHistory()
+        when {
+            e.status == HistoryEntry.Status.OK && e.text != null -> injectText(e.text, feedback = "Inserted from history")
+            e.canRetry && state == State.IDLE -> retryFromHistory(e)
+            else -> showFeedback("This recording's audio wasn't kept", 2000)
+        }
+    }
+
+    /** Retries a failed entry and types the result into the focused field, like a normal dictation. */
+    private fun retryFromHistory(e: HistoryEntry) {
+        session++
+        val id = session
+        state = State.TRANSCRIBING
+        setAppearance(COLOR_BUSY)
+        setBusy(true)
+        showPillStatus("Retrying…")
+        currentJob = HistoryActions.retry(this, engine, e) { outcome ->
+            if (id != session) return@retry
+            currentJob = null
+            when (outcome) {
+                is TranscriptionEngine.Outcome.Success -> finish(id) { injectText(outcome.text, feedback = outcome.note ?: "Retry succeeded") }
+                is TranscriptionEngine.Outcome.Failure -> finish(id) { showFeedback("Retry failed: ${outcome.error}", 3500) }
+            }
+        }
+        if (currentJob == null) reset("Saved audio is missing")
+    }
+
     private fun removeOverlay() {
+        dismissQuickHistory()
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         overlayView?.let {
             wm.removeView(it)
@@ -488,6 +643,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         } catch (_: SecurityException) { toast("Audio permission denied"); return }
 
         session++
+        targetPackage = rootInActiveWindow?.let { root -> root.packageName?.toString().also { root.recycle() } }
         val stream = ByteArrayOutputStream()
         pcmStream = stream
         val recorder = audioRecord!!
@@ -511,8 +667,6 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
     }
 
-    private enum class Source { CLOUD, LOCAL, LOCAL_FALLBACK }
-
     private fun stopAndTranscribe() {
         state = State.TRANSCRIBING
         stopPulse()
@@ -527,98 +681,27 @@ class WhisperAccessibilityService : AccessibilityService() {
         if (pcm.isEmpty()) { reset("No audio captured"); return }
         showPillStatus("Transcribing…")
 
-        val plan = TranscriptionRouter.plan(
-            mode = settings.mode,
-            online = Connectivity.isOnline(this),
-            hasApiKey = settings.hasApiKey,
-            hasLocalModel = hasLocalModel(),
-            baseUrl = settings.baseUrl,
-        )
-        Log.i(TAG, "Transcription plan: $plan")
         val id = session
-        when (plan) {
-            is TranscriptionRouter.Plan.Cloud -> transcribeCloud(pcm, plan.fallbackToLocal, id)
-            TranscriptionRouter.Plan.Local -> transcribeLocal(pcm, Source.LOCAL, id)
-            is TranscriptionRouter.Plan.Unavailable -> reset(plan.reason)
-        }
-    }
-
-    private fun transcribeCloud(pcm: ByteArray, fallbackToLocal: Boolean, id: Int) {
-        val wav = WavWriter.encode(pcm)
-        currentCall = TranscriberClient.transcribe(wav, settings.cloudConfig()) { result ->
-            if (id != session) return@transcribe
-            currentCall = null
-            when {
-                !result.text.isNullOrBlank() -> handleTranscriptionResult(result.text, Source.CLOUD, id)
-                result.networkFailure && fallbackToLocal -> {
-                    Log.i(TAG, "Cloud unreachable (${result.error}); falling back to local")
-                    showPillStatus("Offline — local model…")
-                    transcribeLocal(pcm, Source.LOCAL_FALLBACK, id)
+        val target = targetPackage
+        currentJob = engine.run(pcm, onStatus = { if (id == session) showPillStatus(it) }) { outcome ->
+            if (id != session) return@run
+            currentJob = null
+            when (outcome) {
+                is TranscriptionEngine.Outcome.Success -> {
+                    if (settings.historyEnabled) history.addSuccess(
+                        outcome.text, outcome.rawText, outcome.source.label, target, HistoryPolicy.durationMs(pcm.size)
+                    )
+                    val prefix = if (outcome.source == TranscriptionEngine.Source.LOCAL_FALLBACK) "Offline — used local model. " else ""
+                    val msg = prefix + (outcome.note ?: "Copied to clipboard")
+                    finish(id) { injectText(outcome.text, feedback = msg, feedbackDurationMs = if (outcome.note != null) 3000 else 2000) }
                 }
-                else -> finishWithError("Error: ${result.error ?: "empty transcript"}", id)
-            }
-        }
-    }
-
-    private fun transcribeLocal(pcm: ByteArray, source: Source, id: Int) {
-        thread {
-            try {
-                val transcriber = obtainLocalModel()
-                if (transcriber == null) { finishWithError("Local model could not be loaded", id); return@thread }
-
-                val samples = pcmToFloat(pcm)
-                val t0 = System.currentTimeMillis()
-                val text = transcriber.transcribe(samples, SAMPLE_RATE)
-                Log.i(TAG, "Local transcription: ${System.currentTimeMillis() - t0}ms, ${samples.size / SAMPLE_RATE}s audio")
-
-                if (id == session) handleTranscriptionResult(text, source, id)
-            } catch (e: Exception) {
-                Log.e(TAG, "Local transcription failed", e)
-                finishWithError("Local error: ${e.message}", id)
-            }
-        }
-    }
-
-    private fun pcmToFloat(pcm: ByteArray): FloatArray {
-        val samples = FloatArray(pcm.size / 2)
-        for (i in samples.indices) {
-            val lo = pcm[i * 2].toInt() and 0xFF
-            val hi = pcm[i * 2 + 1].toInt()
-            samples[i] = ((hi shl 8) or lo).toShort().toFloat() / 32768f
-        }
-        return samples
-    }
-
-    private fun handleTranscriptionResult(text: String?, source: Source, id: Int) {
-        if (text.isNullOrBlank()) { finishWithError("No speech detected", id); return }
-
-        val localNote = if (source == Source.LOCAL_FALLBACK) "Offline — used local model. " else ""
-
-        if (!settings.usePostProcessing) {
-            finish(id) { injectText(text, feedback = "${localNote}Copied to clipboard") }
-            return
-        }
-
-        // Cleanup needs the network; skip it rather than fail when we are offline.
-        val online = source != Source.LOCAL_FALLBACK && Connectivity.isOnline(this)
-        val keyMissing = !settings.hasApiKey &&
-            Endpoints.normalizeBase(settings.baseUrl) == Endpoints.DEFAULT_BASE_URL
-        if (!online || keyMissing) {
-            val why = if (!online) "cleanup skipped (offline)" else "cleanup needs an API key"
-            finish(id) { injectText(text, feedback = "$localNote${why.replaceFirstChar { it.uppercase() }}", feedbackDurationMs = 3000) }
-            return
-        }
-
-        currentCall = PostProcessor.process(
-            text, settings.postProcessingPrompt, settings.baseUrl, settings.apiKey, settings.chatModel
-        ) { result ->
-            if (id != session) return@process
-            currentCall = null
-            finish(id) {
-                if (!result.text.isNullOrBlank()) {
-                    injectText(result.text, feedback = "${localNote}Copied to clipboard")
-                } else {
-                    injectText(text, feedback = "Cleanup failed — raw copied to clipboard", feedbackDurationMs = 3000)
+                is TranscriptionEngine.Outcome.Failure -> {
+                    // Keep the audio so the dictation isn't lost; it can be retried from history.
+                    val saved = settings.historyEnabled &&
+                        HistoryPolicy.durationMs(pcm.size) >= HistoryPolicy.MIN_FAILED_AUDIO_MS
+                    if (saved) history.addFailure(outcome.error, pcm, target)
+                    val msg = if (saved) "${outcome.error} — saved to history, retry from there" else outcome.error
+                    finish(id) { showFeedback(msg, 3500) }
                 }
             }
         }
@@ -640,8 +723,8 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun cancelDictation() {
         if (state == State.IDLE) return
         session++ // late results from the cancelled session are ignored
-        currentCall?.cancel()
-        currentCall = null
+        currentJob?.cancel()
+        currentJob = null
         state = State.IDLE
         releaseRecorder()
         pcmStream = null
@@ -659,7 +742,6 @@ class WhisperAccessibilityService : AccessibilityService() {
         r.release()
     }
 
-    private fun finishWithError(msg: String, id: Int) = finish(id) { toast(msg) }
 
     private fun reset(msg: String) {
         toast(msg)
