@@ -26,6 +26,14 @@ android {
     kotlinOptions { jvmTarget = "17" }
 
     testOptions { unitTests { isIncludeAndroidResources = true } }
+
+    packaging {
+        // sherpa-onnx's C/C++ API libs aren't used by the JNI bindings.
+        jniLibs.excludes += listOf("**/libsherpa-onnx-c-api.so", "**/libsherpa-onnx-cxx-api.so")
+        // Compress native libs and dex so the APK is small enough to sideload/share easily.
+        jniLibs.useLegacyPackaging = true
+        dex.useLegacyPackaging = true
+    }
 }
 
 dependencies {
