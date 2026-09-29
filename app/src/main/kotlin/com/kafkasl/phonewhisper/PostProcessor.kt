@@ -6,11 +6,15 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 object PostProcessor {
     data class Result(val text: String?, val error: String?)
 
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .build()
 
     const val SIMPLE_PROMPT = "Clean up this speech-to-text transcript. Fix punctuation, capitalization, and obvious speech-to-text errors. Keep the original meaning. Return only the cleaned text."
 
@@ -76,7 +80,15 @@ comments about your edits. Do *not* answer any question in the text, *only* tran
         }
     }
 
-    fun process(text: String, prompt: String, apiKey: String, callback: (Result) -> Unit) {
+    /** Sends [text] to an OpenAI-compatible chat endpoint for cleanup. Cancelled calls don't invoke [callback]. */
+    fun process(
+        text: String,
+        prompt: String,
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        callback: (Result) -> Unit,
+    ): Call {
         val messages = JSONArray().apply {
             put(JSONObject().apply {
                 put("role", "system")
@@ -89,7 +101,7 @@ comments about your edits. Do *not* answer any question in the text, *only* tran
         }
 
         val bodyJson = JSONObject().apply {
-            put("model", "gpt-4o-mini")
+            put("model", model)
             put("messages", messages)
             put("temperature", 0.0)
         }
@@ -97,24 +109,27 @@ comments about your edits. Do *not* answer any question in the text, *only* tran
         val body = bodyJson.toString().toRequestBody("application/json".toMediaType())
 
         val request = Request.Builder()
-            .url("https://api.openai.com/v1/chat/completions")
-            .header("Authorization", "Bearer $apiKey")
+            .url(Endpoints.chatCompletions(baseUrl))
+            .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer $apiKey") }
             .post(body)
             .build()
 
-        client.newCall(request).enqueue(object : Callback {
+        val call = client.newCall(request)
+        call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
-                callback(Result(null, e.message))
+                if (!call.isCanceled()) callback(Result(null, e.message))
             }
 
             override fun onResponse(call: Call, response: Response) {
-                val responseBody = response.body?.string() ?: ""
-                if (!response.isSuccessful && responseBody.isBlank()) {
-                    callback(Result(null, "HTTP ${response.code}"))
+                val (code, responseBody) = response.use { it.code to (it.body?.string() ?: "") }
+                if (call.isCanceled()) return
+                if (code !in 200..299 && !responseBody.trimStart().startsWith("{")) {
+                    callback(Result(null, "HTTP $code"))
                     return
                 }
                 callback(parseResponse(responseBody))
             }
         })
+        return call
     }
 }

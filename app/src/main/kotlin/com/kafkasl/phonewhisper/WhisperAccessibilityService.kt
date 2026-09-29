@@ -67,8 +67,16 @@ class WhisperAccessibilityService : AccessibilityService() {
         }?.start()
     }
 
-    // Local transcription engine (loaded lazily)
-    private var localTranscriber: LocalTranscriber? = null
+    // Local transcription engine. Loaded eagerly in local-only mode, otherwise on first use.
+    @Volatile private var localTranscriber: LocalTranscriber? = null
+    private val modelLock = Any()
+
+    private val settings by lazy { AppSettings(this) }
+
+    // Increments on every new recording and on cancel, so late results from an
+    // abandoned session are dropped instead of being typed into the wrong place.
+    @Volatile private var session = 0
+    private var currentCall: okhttp3.Call? = null
 
     private val dp get() = resources.displayMetrics.density
     private val screenW get() = resources.displayMetrics.widthPixels
@@ -77,8 +85,9 @@ class WhisperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         instance = this
         showOverlay()
-        // Try to load local model in background
-        thread { initLocalModel() }
+        // In local-only mode, load the model now so the first dictation is fast.
+        // Otherwise it is loaded only when a fallback actually needs it.
+        if (settings.mode == TranscriptionMode.LOCAL_ONLY) thread { obtainLocalModel() }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
@@ -86,31 +95,38 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         instance = null
+        currentCall?.cancel()
         removeOverlay()
+        thread { unloadLocalModel() }
         super.onDestroy()
     }
 
-    private fun initLocalModel() {
-        val modelName = prefs().getString("model_name", "") ?: ""
-        if (modelName.isBlank()) {
-            // Auto-detect first available model
-            val models = LocalTranscriber.availableModels(this)
-            if (models.isNotEmpty()) {
-                Log.i(TAG, "Auto-detected model: ${models.first()}")
-                localTranscriber = LocalTranscriber.create(this, models.first())
-            }
-        } else {
-            localTranscriber = LocalTranscriber.create(this, modelName)
-        }
-        if (localTranscriber != null) {
-            Log.i(TAG, "Local transcription ready")
-        } else {
-            Log.i(TAG, "No local model found, will use API")
-        }
+    /** Returns the loaded local model, loading it if needed. Blocking; call off the main thread. */
+    private fun obtainLocalModel(): LocalTranscriber? = synchronized(modelLock) {
+        val available = LocalTranscriber.availableModels(this)
+        val wanted = settings.modelName.takeIf { it in available } ?: available.firstOrNull() ?: return null
+        localTranscriber?.let { if (it.modelName == wanted) return it; it.release() }
+        localTranscriber = null
+        val t0 = System.currentTimeMillis()
+        localTranscriber = LocalTranscriber.create(this, wanted)
+        Log.i(TAG, "Loaded local model $wanted in ${System.currentTimeMillis() - t0}ms")
+        localTranscriber
     }
 
-    /** Reload local model (called from MainActivity when settings change) */
-    fun reloadModel() { thread { initLocalModel() } }
+    private fun unloadLocalModel() = synchronized(modelLock) {
+        localTranscriber?.release()
+        localTranscriber = null
+    }
+
+    private fun hasLocalModel() = LocalTranscriber.availableModels(this).isNotEmpty()
+
+    /** Called from MainActivity when the model or mode changes. */
+    fun reloadModel() {
+        thread {
+            unloadLocalModel()
+            if (settings.mode == TranscriptionMode.LOCAL_ONLY) obtainLocalModel()
+        }
+    }
 
     // --- Overlay ---
 
@@ -326,6 +342,7 @@ class WhisperAccessibilityService : AccessibilityService() {
             )
         } catch (_: SecurityException) { toast("Audio permission denied"); return }
 
+        session++
         pcmStream = ByteArrayOutputStream()
         audioRecord!!.startRecording()
         state = State.RECORDING
@@ -342,6 +359,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
     }
 
+    private enum class Source { CLOUD, LOCAL, LOCAL_FALLBACK }
+
     private fun stopAndTranscribe() {
         state = State.TRANSCRIBING
         stopPulse()
@@ -357,113 +376,114 @@ class WhisperAccessibilityService : AccessibilityService() {
 
         if (pcm.isEmpty()) { reset("No audio captured"); return }
 
-        val useLocal = prefs().getBoolean("use_local", true)
-        val local = localTranscriber
-
-        if (useLocal && local != null) {
-            transcribeLocal(pcm, local)
-        } else {
-            transcribeApi(pcm)
+        val plan = TranscriptionRouter.plan(
+            mode = settings.mode,
+            online = Connectivity.isOnline(this),
+            hasApiKey = settings.hasApiKey,
+            hasLocalModel = hasLocalModel(),
+            baseUrl = settings.baseUrl,
+        )
+        Log.i(TAG, "Transcription plan: $plan")
+        val id = session
+        when (plan) {
+            is TranscriptionRouter.Plan.Cloud -> transcribeCloud(pcm, plan.fallbackToLocal, id)
+            TranscriptionRouter.Plan.Local -> transcribeLocal(pcm, Source.LOCAL, id)
+            is TranscriptionRouter.Plan.Unavailable -> reset(plan.reason)
         }
     }
 
-    private fun transcribeLocal(pcm: ByteArray, transcriber: LocalTranscriber) {
+    private fun transcribeCloud(pcm: ByteArray, fallbackToLocal: Boolean, id: Int) {
+        val wav = WavWriter.encode(pcm)
+        currentCall = TranscriberClient.transcribe(wav, settings.cloudConfig()) { result ->
+            if (id != session) return@transcribe
+            currentCall = null
+            when {
+                !result.text.isNullOrBlank() -> handleTranscriptionResult(result.text, Source.CLOUD, id)
+                result.networkFailure && fallbackToLocal -> {
+                    Log.i(TAG, "Cloud unreachable (${result.error}); falling back to local")
+                    transcribeLocal(pcm, Source.LOCAL_FALLBACK, id)
+                }
+                else -> finishWithError("Error: ${result.error ?: "empty transcript"}", id)
+            }
+        }
+    }
+
+    private fun transcribeLocal(pcm: ByteArray, source: Source, id: Int) {
         thread {
             try {
-                // Convert 16-bit PCM bytes to float samples
-                val samples = FloatArray(pcm.size / 2)
-                for (i in samples.indices) {
-                    val lo = pcm[i * 2].toInt() and 0xFF
-                    val hi = pcm[i * 2 + 1].toInt()
-                    samples[i] = ((hi shl 8) or lo).toShort().toFloat() / 32768f
-                }
+                val transcriber = obtainLocalModel()
+                if (transcriber == null) { finishWithError("Local model could not be loaded", id); return@thread }
 
+                val samples = pcmToFloat(pcm)
                 val t0 = System.currentTimeMillis()
                 val text = transcriber.transcribe(samples, SAMPLE_RATE)
-                val ms = System.currentTimeMillis() - t0
-                Log.i(TAG, "Local transcription: ${ms}ms, ${samples.size / SAMPLE_RATE}s audio")
+                Log.i(TAG, "Local transcription: ${System.currentTimeMillis() - t0}ms, ${samples.size / SAMPLE_RATE}s audio")
 
-                handleTranscriptionResult(text)
+                if (id == session) handleTranscriptionResult(text, source, id)
             } catch (e: Exception) {
                 Log.e(TAG, "Local transcription failed", e)
-                handler.post {
-                    toast("Local error: ${e.message}")
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
+                finishWithError("Local error: ${e.message}", id)
             }
         }
     }
 
-    private fun transcribeApi(pcm: ByteArray) {
-        val wav = WavWriter.encode(pcm)
-        val apiKey = prefs().getString("api_key", "") ?: ""
-        if (apiKey.isBlank()) { reset("Set API key in Phone Whisper app"); return }
-
-        TranscriberClient.transcribe(wav, apiKey) { result ->
-            if (result.text != null && result.text.isNotBlank()) {
-                handleTranscriptionResult(result.text)
-            } else {
-                handler.post {
-                    toast("Error: ${result.error ?: "empty transcript"}")
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
-            }
+    private fun pcmToFloat(pcm: ByteArray): FloatArray {
+        val samples = FloatArray(pcm.size / 2)
+        for (i in samples.indices) {
+            val lo = pcm[i * 2].toInt() and 0xFF
+            val hi = pcm[i * 2 + 1].toInt()
+            samples[i] = ((hi shl 8) or lo).toShort().toFloat() / 32768f
         }
+        return samples
     }
 
-    private fun handleTranscriptionResult(text: String?) {
-        if (text.isNullOrBlank()) {
-            handler.post {
-                toast("No speech detected")
-                state = State.IDLE
-                setBusy(false)
-                setAppearance(COLOR_IDLE)
-            }
+    private fun handleTranscriptionResult(text: String?, source: Source, id: Int) {
+        if (text.isNullOrBlank()) { finishWithError("No speech detected", id); return }
+
+        val localNote = if (source == Source.LOCAL_FALLBACK) "Offline — used local model. " else ""
+
+        if (!settings.usePostProcessing) {
+            finish(id) { injectText(text, feedback = "${localNote}Copied to clipboard") }
             return
         }
 
-        val usePostProcessing = prefs().getBoolean("use_post_processing", false)
-        val apiKey = prefs().getString("api_key", "") ?: ""
+        // Cleanup needs the network; skip it rather than fail when we are offline.
+        val online = source != Source.LOCAL_FALLBACK && Connectivity.isOnline(this)
+        val keyMissing = !settings.hasApiKey &&
+            Endpoints.normalizeBase(settings.baseUrl) == Endpoints.DEFAULT_BASE_URL
+        if (!online || keyMissing) {
+            val why = if (!online) "cleanup skipped (offline)" else "cleanup needs an API key"
+            finish(id) { injectText(text, feedback = "$localNote${why.replaceFirstChar { it.uppercase() }}", feedbackDurationMs = 3000) }
+            return
+        }
 
-        if (usePostProcessing) {
-            if (apiKey.isBlank()) {
-                handler.post {
-                    toast("Post-processing needs API key. Using raw text.")
-                    injectText(text)
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
+        currentCall = PostProcessor.process(
+            text, settings.postProcessingPrompt, settings.baseUrl, settings.apiKey, settings.chatModel
+        ) { result ->
+            if (id != session) return@process
+            currentCall = null
+            finish(id) {
+                if (!result.text.isNullOrBlank()) {
+                    injectText(result.text, feedback = "${localNote}Copied to clipboard")
+                } else {
+                    injectText(text, feedback = "Cleanup failed — raw copied to clipboard", feedbackDurationMs = 3000)
                 }
-                return
-            }
-
-            val prompt = prefs().getString("post_processing_prompt", PostProcessor.DEFAULT_PROMPT) ?: PostProcessor.DEFAULT_PROMPT
-            
-            PostProcessor.process(text, prompt, apiKey) { result ->
-                handler.post {
-                    if (result.text != null && result.text.isNotBlank()) {
-                        injectText(result.text)
-                    } else {
-                        injectText(text, feedback = "Cleanup failed — raw copied to clipboard", feedbackDurationMs = 3000)
-                    }
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
-            }
-        } else {
-            handler.post {
-                injectText(text)
-                state = State.IDLE
-                setBusy(false)
-                setAppearance(COLOR_IDLE)
             }
         }
     }
+
+    /** Runs [action] on the main thread and returns to idle, unless the session was cancelled. */
+    private fun finish(id: Int, action: () -> Unit) {
+        handler.post {
+            if (id != session) return@post
+            action()
+            state = State.IDLE
+            setBusy(false)
+            setAppearance(COLOR_IDLE)
+        }
+    }
+
+    private fun finishWithError(msg: String, id: Int) = finish(id) { toast(msg) }
 
     private fun reset(msg: String) {
         toast(msg)
@@ -623,6 +643,5 @@ class WhisperAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun prefs() = getSharedPreferences("phonewhisper", MODE_PRIVATE)
     private fun toast(msg: String) { handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() } }
 }

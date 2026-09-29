@@ -28,6 +28,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var audioRowSub: TextView
     private lateinit var accRowSub: TextView
     private lateinit var keyRowSub: TextView
+    private lateinit var modeRowSub: TextView
+    private lateinit var baseUrlRowSub: TextView
+    private lateinit var sttModelRowSub: TextView
+    private lateinit var languageRowSub: TextView
+    private lateinit var chatModelRowSub: TextView
+    private lateinit var cloudContainer: LinearLayout
+    private val settings by lazy { AppSettings(this) }
     private lateinit var promptRowSub: TextView
     private lateinit var promptRow: LinearLayout
     private lateinit var modelContainer: LinearLayout
@@ -84,24 +91,39 @@ class MainActivity : AppCompatActivity() {
         root.addView(accRow)
 
         // --- Engine Section ---
-        
-        val isCloud = !prefs().getBoolean("use_local", true)
-        
-        val cloudSwitch = MaterialSwitch(this).apply {
-            isChecked = isCloud
-            isClickable = false
+        root.addView(sectionHeader("Transcription"))
+
+        val modeRow = settingsRow("Mode", settings.mode.label) { chooseMode() }
+        modeRowSub = modeRow.findViewWithTag("subtitle")
+        root.addView(modeRow)
+
+        cloudContainer = vertical(0)
+        cloudContainer.addView(sectionHeader("Cloud endpoint"))
+
+        val baseUrlRow = settingsRow("Service", "") { chooseService() }
+        baseUrlRowSub = baseUrlRow.findViewWithTag("subtitle")
+        cloudContainer.addView(baseUrlRow)
+
+        val keyRow = settingsRow("API key", "Tap to set") { promptApiKey() }
+        keyRowSub = keyRow.findViewWithTag("subtitle")
+        cloudContainer.addView(keyRow)
+
+        val sttRow = settingsRow("Transcription model", "") {
+            promptText("Transcription model", settings.sttModel, AppSettings.DEFAULT_STT_MODEL) { settings.sttModel = it }
         }
-        val cloudRow = settingsRow("Use cloud transcription", "Requires OpenAI API key", cloudSwitch) {
-            val newCloud = !cloudSwitch.isChecked
-            prefs().edit().putBoolean("use_local", !newCloud).apply()
-            cloudSwitch.isChecked = newCloud
-            refresh()
+        sttModelRowSub = sttRow.findViewWithTag("subtitle")
+        cloudContainer.addView(sttRow)
+
+        val langRow = settingsRow("Language", "") {
+            promptText("Language code (e.g. en, is). Blank = auto-detect", settings.language, "auto") { settings.language = it }
         }
-        root.addView(cloudRow)
+        languageRowSub = langRow.findViewWithTag("subtitle")
+        cloudContainer.addView(langRow)
+        root.addView(cloudContainer)
 
         // Local Models section
         modelContainer = vertical(0)
-        modelContainer.addView(sectionHeader("Local models"))
+        modelContainer.addView(sectionHeader("Local models (used offline)"))
         for (m in MODEL_CATALOG) modelContainer.addView(buildModelRow(m))
         root.addView(modelContainer)
 
@@ -113,7 +135,7 @@ class MainActivity : AppCompatActivity() {
             isChecked = isPostProcessing
             isClickable = false
         }
-        val postProcessRow = settingsRow("Cleanup transcript", "Uses OpenAI Chat API to fix grammar and punctuation", postProcessSwitch) {
+        val postProcessRow = settingsRow("Cleanup transcript", "Uses the cloud endpoint's chat API; skipped when offline", postProcessSwitch) {
             val newVal = !postProcessSwitch.isChecked
             prefs().edit().putBoolean("use_post_processing", newVal).apply()
             postProcessSwitch.isChecked = newVal
@@ -131,12 +153,11 @@ class MainActivity : AppCompatActivity() {
         promptRowSub.ellipsize = android.text.TextUtils.TruncateAt.END
         root.addView(promptRow)
 
-        // --- Settings Section ---
-        root.addView(sectionHeader("Settings"))
-        
-        val keyRow = settingsRow("OpenAI API Key", "Tap to set") { promptApiKey() }
-        keyRowSub = keyRow.findViewWithTag("subtitle")
-        root.addView(keyRow)
+        val chatRow = settingsRow("Cleanup model", "") {
+            promptText("Cleanup (chat) model", settings.chatModel, AppSettings.DEFAULT_CHAT_MODEL) { settings.chatModel = it }
+        }
+        chatModelRowSub = chatRow.findViewWithTag("subtitle")
+        promptContainer.addView(chatRow)
 
         setContentView(ScrollView(this).apply {
             setBackgroundColor(attrColor(android.R.attr.colorBackground))
@@ -241,7 +262,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun selectModel(archive: String) {
-        prefs().edit().putString("model_name", archive).apply()
+        settings.modelName = archive
         WhisperAccessibilityService.instance?.reloadModel()
         refreshAllCards(); refresh()
     }
@@ -306,22 +327,28 @@ class MainActivity : AppCompatActivity() {
     private fun refresh() {
         val audio = hasPerm(Manifest.permission.RECORD_AUDIO)
         val acc = WhisperAccessibilityService.instance != null
-        val useLocal = prefs().getBoolean("use_local", true)
-        val usePostProcessing = prefs().getBoolean("use_post_processing", false)
-        val hasKey = !prefs().getString("api_key", "").isNullOrBlank()
+        val mode = settings.mode
+        val usePostProcessing = settings.usePostProcessing
+        val hasKey = settings.hasApiKey
         val hasModel = LocalTranscriber.availableModels(this).isNotEmpty()
+        val usesCloud = mode != TranscriptionMode.LOCAL_ONLY
 
         audioRowSub.text = if (audio) "Granted" else "Tap to grant permission"
         accRowSub.text = if (acc) "Enabled" else "Tap to enable in settings"
 
-        modelContainer.visibility = if (useLocal) View.VISIBLE else View.GONE
+        modeRowSub.text = mode.label
+        modelContainer.visibility = if (mode != TranscriptionMode.CLOUD_ONLY) View.VISIBLE else View.GONE
+        cloudContainer.visibility = if (usesCloud || usePostProcessing) View.VISIBLE else View.GONE
         promptContainer.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
         promptRow.visibility = if (usePostProcessing) View.VISIBLE else View.GONE
 
-        val apiKey = prefs().getString("api_key", "") ?: ""
-        keyRowSub.text = if (apiKey.isBlank()) "Tap to set" 
-                         else if (apiKey.length > 7) "sk-...${apiKey.takeLast(4)}" 
-                         else "sk-...***"
+        val apiKey = settings.apiKey
+        keyRowSub.text = if (apiKey.isBlank()) "Not set — tap to set"
+                         else "••••${apiKey.takeLast(4)} (stored encrypted)"
+        baseUrlRowSub.text = "${serviceName(settings.baseUrl)} · ${settings.baseUrl}"
+        sttModelRowSub.text = settings.sttModel
+        languageRowSub.text = settings.language.ifBlank { "Auto-detect" }
+        chatModelRowSub.text = settings.chatModel
 
         val prompt = currentPrompt()
         promptRowSub.text = prompt
@@ -332,13 +359,18 @@ class MainActivity : AppCompatActivity() {
                 ?.let { selectModel(it.archive) }
         }
 
-        // Ready logic
-        val localReady = useLocal && hasModel
-        val cloudReady = !useLocal && hasKey
-        val postReady = !usePostProcessing || hasKey
-        val ready = audio && acc && (localReady || cloudReady) && postReady
+        // Ready logic: can we transcribe at all when online?
+        val plan = TranscriptionRouter.plan(mode, online = true, hasApiKey = hasKey, hasLocalModel = hasModel, baseUrl = settings.baseUrl)
+        val engineReady = plan !is TranscriptionRouter.Plan.Unavailable
+        val ready = audio && acc && engineReady
 
-        statusSubtitle.text = if (ready) "Ready — tap the overlay dot to dictate" else "Setup required"
+        statusSubtitle.text = when {
+            !ready && !engineReady -> (plan as TranscriptionRouter.Plan.Unavailable).reason
+            !ready -> "Setup required"
+            mode == TranscriptionMode.CLOUD_WITH_FALLBACK && !hasModel ->
+                "Ready — download a local model to work offline"
+            else -> "Ready — tap the overlay dot to dictate"
+        }
         statusSubtitle.setTextColor(if (ready) attrColor(com.google.android.material.R.attr.colorPrimary) else attrColor(android.R.attr.textColorSecondary))
         
         refreshAllCards()
@@ -347,16 +379,77 @@ class MainActivity : AppCompatActivity() {
 
     private fun promptApiKey() {
         val input = EditText(this).apply {
-            hint = "sk-..."
-            setText(prefs().getString("api_key", ""))
+            hint = "Paste API key (leave blank if your server needs none)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         }
         android.app.AlertDialog.Builder(this)
-            .setTitle("OpenAI API Key")
+            .setTitle("API key for ${serviceName(settings.baseUrl)}")
             .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
             .setPositiveButton("Save") { _, _ ->
-                prefs().edit().putString("api_key", input.text.toString().trim()).apply()
+                settings.apiKey = input.text.toString()
                 refresh()
             }
+            .setNeutralButton("Clear") { _, _ -> settings.apiKey = ""; refresh() }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun chooseMode() {
+        val modes = TranscriptionMode.values()
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Transcription mode")
+            .setSingleChoiceItems(modes.map { "${it.label}\n${it.description}" }.toTypedArray(), modes.indexOf(settings.mode)) { d, i ->
+                settings.mode = modes[i]
+                WhisperAccessibilityService.instance?.reloadModel()
+                d.dismiss()
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private data class ServicePreset(val name: String, val baseUrl: String, val sttModel: String, val chatModel: String)
+
+    private val servicePresets = listOf(
+        ServicePreset("OpenAI", Endpoints.DEFAULT_BASE_URL, "whisper-1", "gpt-4o-mini"),
+        ServicePreset("Groq", "https://api.groq.com/openai/v1", "whisper-large-v3-turbo", "llama-3.1-8b-instant"),
+    )
+
+    private fun serviceName(baseUrl: String) =
+        servicePresets.firstOrNull { Endpoints.normalizeBase(it.baseUrl) == Endpoints.normalizeBase(baseUrl) }?.name ?: "Custom"
+
+    private fun chooseService() {
+        val labels = servicePresets.map { it.name } + "Custom (OpenAI-compatible URL)…"
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Cloud service")
+            .setItems(labels.toTypedArray()) { _, i ->
+                if (i < servicePresets.size) {
+                    val p = servicePresets[i]
+                    val changed = serviceName(settings.baseUrl) != p.name
+                    settings.baseUrl = p.baseUrl
+                    settings.sttModel = p.sttModel
+                    settings.chatModel = p.chatModel
+                    if (changed && settings.hasApiKey) toast("Service changed — check the API key")
+                    refresh()
+                } else {
+                    promptText("Base URL, e.g. https://whisper.example.com/v1", settings.baseUrl, Endpoints.DEFAULT_BASE_URL) {
+                        settings.baseUrl = Endpoints.normalizeBase(it)
+                    }
+                }
+            }
+            .show()
+    }
+
+    private fun promptText(title: String, current: String, hintText: String, save: (String) -> Unit) {
+        val input = EditText(this).apply {
+            hint = hintText
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setText(current)
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(input.apply { setPadding(dp(24), dp(8), dp(24), dp(8)) })
+            .setPositiveButton("Save") { _, _ -> save(input.text.toString()); refresh() }
             .setNegativeButton("Cancel", null)
             .show()
     }

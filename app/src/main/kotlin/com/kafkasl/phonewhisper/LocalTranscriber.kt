@@ -9,16 +9,30 @@ import java.io.File
  * Local on-device transcription via sherpa-onnx.
  * Models are loaded from the app's external files dir.
  */
-class LocalTranscriber private constructor(private val recognizer: OfflineRecognizer) {
+class LocalTranscriber private constructor(
+    private val recognizer: OfflineRecognizer,
+    val modelName: String,
+) {
+    private var released = false
 
     /** Transcribe raw PCM float samples. Blocking — call from background thread. */
+    @Synchronized
     fun transcribe(samples: FloatArray, sampleRate: Int = 16000): String {
+        check(!released) { "Model was unloaded" }
         val stream = recognizer.createStream()
         stream.acceptWaveform(samples, sampleRate)
         recognizer.decode(stream)
         val result = recognizer.getResult(stream)
         stream.release()
         return result.text.trim()
+    }
+
+    /** Frees the native model. Waits for any transcription in progress to finish. */
+    @Synchronized
+    fun release() {
+        if (released) return
+        released = true
+        recognizer.release()
     }
 
     companion object {
@@ -47,7 +61,7 @@ class LocalTranscriber private constructor(private val recognizer: OfflineRecogn
             return try {
                 val recognizer = OfflineRecognizer(assetManager = null, config = config)
                 Log.i(TAG, "Loaded model: $modelName")
-                LocalTranscriber(recognizer)
+                LocalTranscriber(recognizer, modelName)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load model: ${e.message}")
                 null
