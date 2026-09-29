@@ -93,6 +93,13 @@ class MainActivity : AppCompatActivity() {
         accRowSub = accRow.findViewWithTag("subtitle")
         root.addView(accRow)
 
+        val typingSwitch = MaterialSwitch(this).apply { isChecked = settings.showOnlyWhenTyping; isClickable = false }
+        root.addView(settingsRow("Show bubble only when typing", "Hides the bubble unless the keyboard is up or a text field is focused", typingSwitch) {
+            settings.showOnlyWhenTyping = !settings.showOnlyWhenTyping
+            typingSwitch.isChecked = settings.showOnlyWhenTyping
+            WhisperAccessibilityService.instance?.refreshVisibility()
+        })
+
         // --- History Section ---
         root.addView(sectionHeader("History"))
         root.addView(settingsRow("View history", "Copy past dictations, retry failed ones. Tip: long-press the bubble for recent ones.") {

@@ -53,6 +53,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val PILL_W_DP = 216
         private const val PILL_GAP_DP = 6
         private const val QUICK_HISTORY_COUNT = 10
+        private const val VISIBILITY_DEBOUNCE_MS = 120L
+        private const val HIDE_DELAY_MS = 600L
     }
 
     private enum class State { IDLE, RECORDING, TRANSCRIBING }
@@ -109,6 +111,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         instance = this
         showOverlay()
+        refreshVisibility()
         HistoryCleanupWorker.schedule(this)
         thread {
             history.prune(settings.retentionDays)
@@ -118,7 +121,61 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    // --- Show only when typing ---
+
+    private var bubbleVisible = true
+    private val evaluateVisibility = Runnable { applyVisibility(computeTypingState()) }
+    private val hideBubbleNow = Runnable { setBubbleVisible(false) }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (!settings.showOnlyWhenTyping) return
+        // Coalesce bursts of focus/window events into one check.
+        handler.removeCallbacks(evaluateVisibility)
+        handler.postDelayed(evaluateVisibility, VISIBILITY_DEBOUNCE_MS)
+    }
+
+    /** True when the keyboard is on screen or an editable field has input focus. */
+    private fun computeTypingState(): Boolean {
+        val imeVisible = try {
+            windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+        } catch (_: Exception) { false }
+        if (imeVisible) return true
+        val root = rootInActiveWindow ?: return false
+        return try {
+            if (root.packageName == packageName) return false // our own settings screen
+            root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { focus ->
+                (focus.isEditable || focus.className?.toString()?.contains("EditText") == true).also { focus.recycle() }
+            } ?: false
+        } finally { root.recycle() }
+    }
+
+    private fun applyVisibility(typing: Boolean) {
+        val keepVisible = !settings.showOnlyWhenTyping || typing ||
+            state != State.IDLE || sheetView != null
+        if (keepVisible) {
+            handler.removeCallbacks(hideBubbleNow)
+            setBubbleVisible(true)
+        } else if (bubbleVisible) {
+            // Short grace period so moving between fields doesn't flicker the bubble.
+            handler.removeCallbacks(hideBubbleNow)
+            handler.postDelayed(hideBubbleNow, HIDE_DELAY_MS)
+        }
+    }
+
+    private fun setBubbleVisible(visible: Boolean) {
+        val view = overlayView ?: return
+        val params = layoutParams ?: return
+        if (visible == bubbleVisible) return
+        bubbleVisible = visible
+        view.visibility = if (visible) View.VISIBLE else View.GONE
+        // A hidden overlay must not swallow touches meant for the app underneath.
+        params.flags = if (visible) params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            else params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(view, params)
+    }
+
+    /** Called from settings when the show-only-when-typing option changes. */
+    fun refreshVisibility() = handler.post { applyVisibility(computeTypingState()) }
     override fun onInterrupt() {}
 
     override fun onDestroy() {
@@ -392,8 +449,10 @@ class WhisperAccessibilityService : AccessibilityService() {
     }
 
     private fun dismissQuickHistory() {
-        sheetView?.let { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) }
+        val sheet = sheetView ?: return
+        (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(sheet)
         sheetView = null
+        handler.post { if (overlayView != null) applyVisibility(computeTypingState()) }
     }
 
     private fun buildQuickHistory(entries: List<HistoryEntry>) {
@@ -542,6 +601,8 @@ class WhisperAccessibilityService : AccessibilityService() {
             feedbackView = null
         }
         handler.removeCallbacks(tickTimer)
+        handler.removeCallbacks(evaluateVisibility)
+        handler.removeCallbacks(hideBubbleNow)
         if (pillShown) pillView?.let { wm.removeView(it) }
         pillShown = false
         pillView = null
@@ -716,6 +777,7 @@ class WhisperAccessibilityService : AccessibilityService() {
             setBusy(false)
             setAppearance(COLOR_IDLE)
             hidePill()
+            applyVisibility(computeTypingState())
         }
     }
 
@@ -733,6 +795,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         setAppearance(COLOR_IDLE)
         hidePill()
         showFeedback("Cancelled", 1200)
+        applyVisibility(computeTypingState())
     }
 
     private fun releaseRecorder() {
@@ -749,6 +812,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         setBusy(false)
         setAppearance(COLOR_IDLE)
         hidePill()
+        handler.post { applyVisibility(computeTypingState()) }
     }
 
     // --- Text injection ---
