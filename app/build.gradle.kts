@@ -34,6 +34,8 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("com.google.android.material:material:1.12.0")
     implementation("org.apache.commons:commons-compress:1.27.1")
+    // sherpa-onnx: Kotlin API + native libs for on-device speech recognition
+    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:v1.13.8")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
