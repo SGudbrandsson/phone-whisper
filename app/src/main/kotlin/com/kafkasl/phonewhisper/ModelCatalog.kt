@@ -1,9 +1,6 @@
 package com.kafkasl.phonewhisper
 
-import okhttp3.Call
-import okhttp3.Callback
 import okhttp3.Request
-import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -28,6 +25,8 @@ data class RemoteModel(val id: String, val kind: Kind, val ownedBy: String? = nu
  * - `capabilities` (Mistral: a transcription flag, `completion_chat`, `audio`)
  * - `architecture.input_modalities` / `output_modalities` (OpenRouter)
  * OpenAI, Groq and Gemini's OpenAI-compatible endpoint return only ids, so names decide there.
+ * LiteLLM proxies list only the user's aliases; their `/model/info` gives each alias a `mode`
+ * and the upstream model name, which is used when available.
  */
 object ModelCatalog {
 
@@ -152,20 +151,72 @@ object ModelCatalog {
         return FetchResult(null, if (detail.isNotBlank()) "$hint: $detail" else hint)
     }
 
-    /** Fetches `GET {base}/models`. [callback] runs on a background thread. */
-    fun fetch(baseUrl: String, apiKey: String, callback: (FetchResult) -> Unit): Call {
-        val call = TranscriberClient.client.newCall(buildRequest(baseUrl, apiKey))
-        call.enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                if (!call.isCanceled()) callback(FetchResult(null, "Could not connect: ${e.message ?: e.javaClass.simpleName}"))
+    /**
+     * Fetches `GET {base}/models`, then LiteLLM's `/model/info` on servers that aren't a known
+     * public API. Blocking; call off the main thread.
+     */
+    fun fetchBlocking(baseUrl: String, apiKey: String): FetchResult {
+        val listed = try {
+            TranscriberClient.client.newCall(buildRequest(baseUrl, apiKey)).execute()
+                .use { parseHttp(it.code, it.body?.string() ?: "") }
+        } catch (e: IOException) {
+            return FetchResult(null, "Could not connect: ${e.message ?: e.javaClass.simpleName}")
+        }
+        val models = listed.models ?: return listed
+        if (isKnownPublicApi(baseUrl)) return listed
+        val info = try {
+            val req = Request.Builder().url(Endpoints.normalizeBase(baseUrl) + "/model/info")
+                .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer ${apiKey.trim()}") }
+                .get().build()
+            TranscriberClient.client.newCall(req).execute().use { r ->
+                if (r.isSuccessful) parseLiteLlmInfo(r.body?.string() ?: "") else emptyMap()
             }
-            override fun onResponse(call: Call, response: Response) {
-                val result = response.use { parseHttp(it.code, it.body?.string() ?: "") }
-                if (!call.isCanceled()) callback(result)
-            }
-        })
-        return call
+        } catch (_: Exception) { emptyMap() }
+        return FetchResult(models.map { m -> info[m.id]?.let { m.copy(kind = it) } ?: m }, null)
     }
+
+    /** [callback] runs on a background thread. */
+    fun fetch(baseUrl: String, apiKey: String, callback: (FetchResult) -> Unit) {
+        Thread { callback(fetchBlocking(baseUrl, apiKey)) }.start()
+    }
+
+    private val PUBLIC_HOSTS = listOf(
+        "api.openai.com", "api.groq.com", "api.mistral.ai", "openrouter.ai", "generativelanguage.googleapis.com",
+    )
+
+    private fun isKnownPublicApi(baseUrl: String): Boolean {
+        val host = Endpoints.normalizeBase(baseUrl).substringAfter("://").substringBefore('/').substringBefore(':')
+        return PUBLIC_HOSTS.any { host == it || host.endsWith(".$it") }
+    }
+
+    /**
+     * LiteLLM `GET /model/info`: `{"data":[{"model_name": alias, "litellm_params": {"model":
+     * "elevenlabs/scribe_v1"}, "model_info": {"mode": "audio_transcription", ...}}]}`.
+     * Returns alias -> kind; aliases without usable info are left out.
+     */
+    fun parseLiteLlmInfo(json: String): Map<String, RemoteModel.Kind> = try {
+        val data = JSONObject(json).optJSONArray("data") ?: JSONArray()
+        val out = HashMap<String, RemoteModel.Kind>()
+        for (i in 0 until data.length()) {
+            val obj = data.optJSONObject(i) ?: continue
+            val alias = obj.optString("model_name")
+            if (alias.isBlank()) continue
+            val upstream = obj.optJSONObject("litellm_params")?.optString("model").orEmpty()
+            val info = obj.optJSONObject("model_info")
+            val mode = info?.optString("mode").orEmpty().lowercase()
+            val kind = when {
+                mode == "audio_transcription" -> RemoteModel.Kind.STT
+                mode in setOf("chat", "completion", "responses") ->
+                    if (info?.optBoolean("supports_audio_input", false) == true) RemoteModel.Kind.AUDIO_CHAT
+                    else RemoteModel.Kind.CHAT
+                mode.isNotEmpty() -> RemoteModel.Kind.OTHER // embedding, image_generation, audio_speech, rerank, ...
+                upstream.isNotBlank() -> fromName(upstream)
+                else -> null
+            }
+            if (kind != null) out[alias] = kind
+        }
+        out
+    } catch (_: Exception) { emptyMap() }
 
     /** One line for "Test connection". */
     fun describe(result: FetchResult, selectedStt: String? = null): String {

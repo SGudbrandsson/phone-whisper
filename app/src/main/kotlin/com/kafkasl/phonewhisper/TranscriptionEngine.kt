@@ -150,10 +150,11 @@ class TranscriptionEngine(private val ctx: Context) {
     fun obtainLocalModel(): LocalTranscriber? = synchronized(modelLock) {
         val available = LocalTranscriber.availableModels(ctx)
         val wanted = settings.modelName.takeIf { it in available } ?: available.firstOrNull() ?: return null
-        local?.let { if (it.modelName == wanted) return it; it.release() }
+        val language = settings.language
+        local?.let { if (it.modelName == wanted && it.language == language) return it; it.release() }
         local = null
         val t0 = System.currentTimeMillis()
-        local = LocalTranscriber.create(ctx, wanted)
+        local = LocalTranscriber.create(ctx, wanted, language)
         Log.i(TAG, "Loaded local model $wanted in ${System.currentTimeMillis() - t0}ms")
         local
     }

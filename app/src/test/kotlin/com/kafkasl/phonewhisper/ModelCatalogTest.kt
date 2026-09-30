@@ -129,6 +129,46 @@ class ModelCatalogTest {
         assertEquals("https://h/v1", Endpoints.normalizeBase("https://h/v1/models"))
     }
 
+    @Test fun `litellm model info modes`() {
+        val info = ModelCatalog.parseLiteLlmInfo("""{"data":[
+            {"model_name":"eleven","litellm_params":{"model":"elevenlabs/scribe_v1"},"model_info":{"mode":"audio_transcription"}},
+            {"model_name":"fast","litellm_params":{"model":"groq/llama-3.1-8b-instant"},"model_info":{"mode":"chat","supports_audio_input":false}},
+            {"model_name":"listen","litellm_params":{"model":"gemini/gemini-2.5-flash"},"model_info":{"mode":"chat","supports_audio_input":true}},
+            {"model_name":"voice","litellm_params":{"model":"elevenlabs/eleven_multilingual_v2"},"model_info":{"mode":"audio_speech"}},
+            {"model_name":"nomode","litellm_params":{"model":"openai/whisper-1"},"model_info":{}},
+            {"model_name":"","litellm_params":{"model":"x"}}
+        ]}""")
+        assertEquals(mapOf("eleven" to Kind.STT, "fast" to Kind.CHAT, "listen" to Kind.AUDIO_CHAT,
+            "voice" to Kind.OTHER, "nomode" to Kind.STT), info)
+        assertTrue(ModelCatalog.parseLiteLlmInfo("not json").isEmpty())
+    }
+
+    @Test fun `litellm aliases get kinds from model info`() {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setBody("""{"data":[{"id":"eleven","object":"model","owned_by":"openai"},{"id":"fast","object":"model"}]}"""))
+        server.enqueue(MockResponse().setBody("""{"data":[{"model_name":"eleven","litellm_params":{"model":"elevenlabs/scribe_v1"},"model_info":{"mode":"audio_transcription"}}]}"""))
+        server.start()
+        try {
+            val r = ModelCatalog.fetchBlocking(server.url("/v1").toString(), "sk-litellm")
+            assertEquals(mapOf("eleven" to Kind.STT, "fast" to Kind.CHAT), r.models!!.associate { it.id to it.kind })
+            server.takeRequest()
+            val info = server.takeRequest()
+            assertEquals("/v1/model/info", info.path)
+            assertEquals("Bearer sk-litellm", info.getHeader("Authorization"))
+        } finally { server.shutdown() }
+    }
+
+    @Test fun `missing model info is ignored`() {
+        val server = MockWebServer()
+        server.enqueue(MockResponse().setBody("""{"data":[{"id":"whisper-1"}]}"""))
+        server.enqueue(MockResponse().setResponseCode(404))
+        server.start()
+        try {
+            val r = ModelCatalog.fetchBlocking(server.url("/v1").toString(), "")
+            assertEquals(Kind.STT, r.models!!.single().kind)
+        } finally { server.shutdown() }
+    }
+
     @Test fun `http errors are readable`() {
         assertEquals("API key rejected: Incorrect API key provided",
             ModelCatalog.parseHttp(401, """{"error":{"message":"Incorrect API key provided"}}""").error)
@@ -139,6 +179,7 @@ class ModelCatalogTest {
     @Test fun `fetch sends the key and parses the list`() {
         val server = MockWebServer()
         server.enqueue(MockResponse().setBody("""{"data":[{"id":"whisper-1"},{"id":"gpt-4o-mini"}]}"""))
+        server.enqueue(MockResponse().setResponseCode(404)) // not a LiteLLM proxy
         server.start()
         try {
             val latch = CountDownLatch(1)
