@@ -25,6 +25,7 @@ import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.VisibleForTesting
 import java.io.ByteArrayOutputStream
 import kotlin.concurrent.thread
 import kotlin.math.abs
@@ -59,18 +60,22 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val MAX_RECORDING_BYTES = 10 * 60 * 16000 * 2
     }
 
-    private enum class State { IDLE, RECORDING, TRANSCRIBING }
+    @VisibleForTesting internal enum class State { IDLE, RECORDING, TRANSCRIBING }
 
-    @Volatile private var state = State.IDLE
-    private var overlayView: FrameLayout? = null
+    @VisibleForTesting @Volatile internal var state = State.IDLE
+        private set
+    @VisibleForTesting internal var overlayView: FrameLayout? = null
+        private set
     private var button: ImageView? = null
     private var spinner: ProgressBar? = null
-    private var feedbackView: TextView? = null
+    @VisibleForTesting internal var feedbackView: TextView? = null
+        private set
     private var layoutParams: WindowManager.LayoutParams? = null
     private var feedbackLayoutParams: WindowManager.LayoutParams? = null
 
     // Recording pill: [✕] waveform/status timer [✓], shown beside the bubble while busy.
-    private var pillView: android.widget.LinearLayout? = null
+    @VisibleForTesting internal var pillView: android.widget.LinearLayout? = null
+        private set
     private var pillParams: WindowManager.LayoutParams? = null
     private var pillShown = false
     private var waveform: WaveformView? = null
@@ -110,7 +115,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     private val screenW get() = resources.displayMetrics.widthPixels
     private val screenH get() = resources.displayMetrics.heightPixels
 
-    override fun onServiceConnected() {
+    public override fun onServiceConnected() { // public so tests can drive it
         instance = this
         showOverlay()
         refreshVisibility()
@@ -281,10 +286,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                     params.x = startX + (ev.rawX - touchX).toInt()
                     params.y = startY + (ev.rawY - touchY).toInt()
                     wm.updateViewLayout(v, params)
-                    feedbackLayoutParams?.let {
-                        positionFeedback(it, params)
-                        wm.updateViewLayout(feedbackView, it)
-                    }
+                    moveFeedbackWithBubble()
                     updatePillPosition()
                     true
                 }
@@ -298,10 +300,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                         params.x = if (params.x + ringSize / 2 > screenW / 2)
                             screenW - ringSize - margin else margin
                         wm.updateViewLayout(v, params)
-                        feedbackLayoutParams?.let {
-                            positionFeedback(it, params)
-                            wm.updateViewLayout(feedbackView, it)
-                        }
+                        moveFeedbackWithBubble()
                         updatePillPosition()
                     }
                     true
@@ -340,6 +339,15 @@ class WhisperAccessibilityService : AccessibilityService() {
         layoutParams = params
         feedbackLayoutParams = feedbackParams
         buildPill(ringSize)
+    }
+
+    /** Keeps the feedback toast next to the bubble. Both are added in [showOverlay]. */
+    private fun moveFeedbackWithBubble() {
+        val view = feedbackView ?: return
+        val fp = feedbackLayoutParams ?: return
+        val bp = layoutParams ?: return
+        positionFeedback(fp, bp)
+        (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(view, fp)
     }
 
     private fun buildPill(height: Int) {
@@ -442,9 +450,11 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun attachPill() {
         val pill = pillView ?: return
         if (!pillShown) {
-            pillShown = true
+            // Position first: with pillShown still false this only computes the params.
+            // updateViewLayout on a view that isn't added yet throws IllegalArgumentException.
             updatePillPosition()
             (getSystemService(WINDOW_SERVICE) as WindowManager).addView(pill, pillParams)
+            pillShown = true
         }
     }
 
@@ -459,7 +469,8 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     // --- Quick history (long-press the bubble) ---
 
-    private var sheetView: View? = null
+    @VisibleForTesting internal var sheetView: View? = null
+        private set
 
     private fun isLocked() = (getSystemService(KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked
 
@@ -693,18 +704,25 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
     }
 
+    private var pulse: android.animation.ObjectAnimator? = null
+
     private fun startPulse() {
-        button?.let {
-            it.animate().alpha(0.4f).setDuration(500).withEndAction {
-                it.animate().alpha(1f).setDuration(500).withEndAction {
-                    if (state == State.RECORDING) startPulse()
-                }.start()
-            }.start()
+        stopPulse()
+        // One repeating animator. Chaining end actions would spin the main thread when the
+        // user has turned animations off, since each animation then ends immediately.
+        if (!android.animation.ValueAnimator.areAnimatorsEnabled()) return
+        val b = button ?: return
+        pulse = android.animation.ObjectAnimator.ofFloat(b, View.ALPHA, 1f, 0.4f).apply {
+            duration = 500
+            repeatCount = android.animation.ValueAnimator.INFINITE
+            repeatMode = android.animation.ValueAnimator.REVERSE
+            start()
         }
     }
 
     private fun stopPulse() {
-        button?.animate()?.cancel()
+        pulse?.cancel()
+        pulse = null
         button?.alpha = 1f
     }
 
