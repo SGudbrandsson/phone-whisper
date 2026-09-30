@@ -54,6 +54,8 @@ class TranscriberClientHttpTest {
             val body = req.body.readUtf8()
             assertTrue(body.contains("whisper-large-v3-turbo"))
             assertTrue(body.contains("name=\"language\""))
+            // LiteLLM rejects response_format for ElevenLabs ("encoding format is not supported").
+            assertFalse(body.contains("response_format"))
         } finally { server.shutdown() }
     }
 

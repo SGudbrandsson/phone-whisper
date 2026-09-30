@@ -53,12 +53,15 @@ object TranscriberClient {
         } else Result(null, "HTTP $code")
     }
 
+    /**
+     * Only model, file and (optional) language are sent. JSON is every server's default, and
+     * proxies such as LiteLLM reject `response_format` for providers like ElevenLabs.
+     */
     fun buildRequest(wavData: ByteArray, config: Config): Request {
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("model", config.model)
             .apply { if (config.language.isNotBlank()) addFormDataPart("language", config.language) }
-            .addFormDataPart("response_format", "json")
             .addFormDataPart("file", "audio.wav", wavData.toRequestBody("audio/wav".toMediaType()))
             .build()
 

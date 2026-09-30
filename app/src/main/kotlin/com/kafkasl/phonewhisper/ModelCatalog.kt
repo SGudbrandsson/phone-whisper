@@ -255,6 +255,7 @@ object ModelLoader {
             val result = ModelCatalog.fetchBlocking(base, settings.apiKey)
             if (result.models != null && Endpoints.normalizeBase(settings.baseUrl) == Endpoints.normalizeBase(base)) {
                 settings.cachedModels = result.models
+                Diagnostics.info("ModelLoader", ModelCatalog.describe(result))
             } else if (result.error != null) {
                 Diagnostics.warn("ModelLoader", "GET /models failed: ${result.error}")
             }
