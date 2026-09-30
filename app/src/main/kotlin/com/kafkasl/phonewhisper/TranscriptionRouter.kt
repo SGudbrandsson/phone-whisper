@@ -4,7 +4,7 @@ package com.kafkasl.phonewhisper
 object Endpoints {
     const val DEFAULT_BASE_URL = "https://api.openai.com/v1"
 
-    private val KNOWN_SUFFIXES = listOf("/audio/transcriptions", "/chat/completions")
+    private val KNOWN_SUFFIXES = listOf("/audio/transcriptions", "/chat/completions", "/models")
 
     /**
      * Normalise what the user typed: trims whitespace and trailing slashes, and strips a
@@ -22,6 +22,7 @@ object Endpoints {
 
     fun transcriptions(base: String) = normalizeBase(base) + "/audio/transcriptions"
     fun chatCompletions(base: String) = normalizeBase(base) + "/chat/completions"
+    fun models(base: String) = normalizeBase(base) + "/models"
 }
 
 /** Decides which engine handles a recording. Pure logic so it can be unit tested. */

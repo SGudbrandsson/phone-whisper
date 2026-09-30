@@ -26,6 +26,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusSubtitle: TextView
     private lateinit var crashBanner: View
+    private lateinit var testRowSub: TextView
     private lateinit var audioRowSub: TextView
     private lateinit var accRowSub: TextView
     private lateinit var keyRowSub: TextView
@@ -156,7 +157,9 @@ class MainActivity : AppCompatActivity() {
         cloudContainer.addView(keyRow)
 
         val sttRow = settingsRow("Transcription model", "") {
-            promptText("Transcription model", settings.sttModel, AppSettings.DEFAULT_STT_MODEL) { settings.sttModel = it }
+            ModelPickerDialog(this, settings, "Transcription model", settings.sttModel, ModelCatalog::forTranscription) {
+                settings.sttModel = it; refresh()
+            }.show()
         }
         sttModelRowSub = sttRow.findViewWithTag("subtitle")
         cloudContainer.addView(sttRow)
@@ -166,6 +169,10 @@ class MainActivity : AppCompatActivity() {
         }
         languageRowSub = langRow.findViewWithTag("subtitle")
         cloudContainer.addView(langRow)
+
+        val testRow = settingsRow("Test connection", "Checks the endpoint and key by listing models") { testConnection() }
+        testRowSub = testRow.findViewWithTag("subtitle")
+        cloudContainer.addView(testRow)
         root.addView(cloudContainer)
 
         // Local Models section
@@ -201,7 +208,9 @@ class MainActivity : AppCompatActivity() {
         root.addView(promptRow)
 
         val chatRow = settingsRow("Cleanup model", "") {
-            promptText("Cleanup (chat) model", settings.chatModel, AppSettings.DEFAULT_CHAT_MODEL) { settings.chatModel = it }
+            ModelPickerDialog(this, settings, "Cleanup model", settings.chatModel, ModelCatalog::forCleanup) {
+                settings.chatModel = it; refresh()
+            }.show()
         }
         chatModelRowSub = chatRow.findViewWithTag("subtitle")
         promptContainer.addView(chatRow)
@@ -480,10 +489,20 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("Save") { _, _ ->
                 settings.apiKey = input.text.toString()
                 refresh()
+                testConnection()
             }
             .setNeutralButton("Clear") { _, _ -> settings.apiKey = ""; refresh() }
             .setNegativeButton("Cancel", null)
             .show()
+    }
+
+    /** Lists models to check endpoint and key; also refreshes the pickers' cached list. */
+    private fun testConnection() {
+        testRowSub.text = "Connecting…"
+        ModelLoader.refresh(settings) { result ->
+            if (isDestroyed) return@refresh
+            testRowSub.text = ModelCatalog.describe(result, settings.sttModel)
+        }
     }
 
     private fun chooseMode() {
@@ -523,12 +542,14 @@ class MainActivity : AppCompatActivity() {
                     settings.chatModel = p.chatModel
                     if (changed && settings.hasApiKey) toast("Service changed — check the API key")
                     refresh()
+                    testConnection()
                 } else {
                     promptText("Base URL, e.g. https://whisper.example.com/v1", settings.baseUrl, Endpoints.DEFAULT_BASE_URL) {
                         settings.baseUrl = Endpoints.normalizeBase(it)
                         if (settings.baseUrl.startsWith("http://")) {
                             toast("Unencrypted http — audio and API key are sent in the clear. Use only on a trusted network.")
                         }
+                        testConnection()
                     }
                 }
             }

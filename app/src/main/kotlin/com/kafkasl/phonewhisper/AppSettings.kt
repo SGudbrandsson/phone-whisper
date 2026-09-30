@@ -92,6 +92,15 @@ class AppSettings(private val ctx: Context) {
         get() = prefs.getBoolean(KEY_ONLY_WHEN_TYPING, true)
         set(value) { prefs.edit().putBoolean(KEY_ONLY_WHEN_TYPING, value).apply() }
 
+    /** Last `GET /models` result for the current endpoint; empty if none or the endpoint changed. */
+    var cachedModels: List<RemoteModel>
+        get() = if (prefs.getString(KEY_MODELS_BASE, null) == Endpoints.normalizeBase(baseUrl))
+            ModelCatalog.fromJson(prefs.getString(KEY_MODELS, "[]") ?: "[]") else emptyList()
+        set(value) {
+            prefs.edit().putString(KEY_MODELS_BASE, Endpoints.normalizeBase(baseUrl))
+                .putString(KEY_MODELS, ModelCatalog.toJson(value)).apply()
+        }
+
     fun cloudConfig() = TranscriberClient.Config(baseUrl, apiKey, sttModel, language)
 
     companion object {
@@ -108,6 +117,8 @@ class AppSettings(private val ctx: Context) {
         private const val KEY_HISTORY_ENABLED = "history_enabled"
         private const val KEY_RETENTION_DAYS = "history_retention_days"
         private const val KEY_ONLY_WHEN_TYPING = "show_only_when_typing"
+        private const val KEY_MODELS = "models_cache"
+        private const val KEY_MODELS_BASE = "models_cache_base"
         private const val LEGACY_USE_LOCAL = "use_local"
         private const val LEGACY_API_KEY = "api_key"
     }
