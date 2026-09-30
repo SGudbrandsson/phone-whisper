@@ -51,6 +51,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val COLOR_PILL_BG = 0xEE1C1C1E.toInt()
         private const val COLOR_CANCEL = 0xFF3A3A3C.toInt()
         private const val COLOR_STOP = 0xFFEF4444.toInt()
+        /** Hairline around the bubble and pill so they stand out on dark screens. */
+        private const val COLOR_OUTLINE = 0x33FFFFFF
         private const val PILL_W_DP = 216
         private const val PILL_GAP_DP = 6
         private const val QUICK_HISTORY_COUNT = 10
@@ -79,9 +81,11 @@ class WhisperAccessibilityService : AccessibilityService() {
     private var pillParams: WindowManager.LayoutParams? = null
     private var pillShown = false
     private var waveform: WaveformView? = null
+    @VisibleForTesting internal val waveformForTest get() = waveform
     private var pillStatus: TextView? = null
     private var pillTimer: TextView? = null
-    private var pillStop: TextView? = null
+    private var pillStop: View? = null
+    private var pillBusy: View? = null
     private var recordStartMs = 0L
     private val tickTimer = object : Runnable {
         override fun run() {
@@ -353,19 +357,28 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     private fun buildPill(height: Int) {
         val btn = (34 * dp).toInt()
-        fun roundButton(label: String, color: Int, desc: String, onClick: () -> Unit) = TextView(this).apply {
-            text = label
-            textSize = 16f
-            gravity = Gravity.CENTER
-            setTextColor(0xFFFFFFFF.toInt())
-            background = circle(color)
+        val iconPad = (8 * dp).toInt()
+        fun roundButton(icon: Int, color: Int, desc: String, onClick: () -> Unit) = ImageView(this).apply {
+            setImageResource(icon)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setPadding(iconPad, iconPad, iconPad, iconPad)
+            background = android.graphics.drawable.RippleDrawable(
+                ColorStateList.valueOf(0x33FFFFFF), circle(color, outline = false), null)
             contentDescription = desc
             setOnClickListener { onClick() }
             layoutParams = android.widget.LinearLayout.LayoutParams(btn, btn)
         }
 
-        val cancel = roundButton("✕", COLOR_CANCEL, "Cancel dictation") { cancelDictation() }
-        val stop = roundButton("✓", COLOR_STOP, "Stop and transcribe") { if (state == State.RECORDING) stopAndTranscribe() }
+        val cancel = roundButton(R.drawable.ic_close, COLOR_CANCEL, "Cancel dictation") { cancelDictation() }
+        val stop = roundButton(R.drawable.ic_check, COLOR_STOP, "Stop and transcribe") { if (state == State.RECORDING) stopAndTranscribe() }
+        val busy = ProgressBar(this).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(0xCCFFFFFF.toInt())
+            visibility = View.GONE
+            layoutParams = android.widget.LinearLayout.LayoutParams((16 * dp).toInt(), (16 * dp).toInt()).apply {
+                marginStart = (12 * dp).toInt()
+            }
+        }
 
         val wave = WaveformView(this).apply {
             layoutParams = android.widget.LinearLayout.LayoutParams(0, (22 * dp).toInt(), 1f).apply {
@@ -379,7 +392,7 @@ class WhisperAccessibilityService : AccessibilityService() {
             ellipsize = android.text.TextUtils.TruncateAt.END
             visibility = View.GONE
             layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                marginStart = (10 * dp).toInt(); marginEnd = (6 * dp).toInt()
+                marginStart = (8 * dp).toInt(); marginEnd = (6 * dp).toInt()
             }
         }
         val timer = TextView(this).apply {
@@ -400,8 +413,9 @@ class WhisperAccessibilityService : AccessibilityService() {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = height / 2f
                 setColor(COLOR_PILL_BG)
+                setStroke(maxOf(1, dp.toInt()), COLOR_OUTLINE) // keeps the pill visible on dark apps
             }
-            addView(cancel); addView(wave); addView(status); addView(timer); addView(stop)
+            addView(cancel); addView(wave); addView(busy); addView(status); addView(timer); addView(stop)
         }
 
         pillParams = WindowManager.LayoutParams(
@@ -410,7 +424,7 @@ class WhisperAccessibilityService : AccessibilityService() {
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
-        pillView = pill; waveform = wave; pillStatus = status; pillTimer = timer; pillStop = stop
+        pillView = pill; waveform = wave; pillStatus = status; pillTimer = timer; pillStop = stop; pillBusy = busy
     }
 
     /** Places the pill on whichever side of the bubble has room. */
@@ -431,6 +445,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         waveform?.clear()
         waveform?.visibility = View.VISIBLE
         pillStatus?.visibility = View.GONE
+        pillBusy?.visibility = View.GONE
         pillStop?.visibility = View.VISIBLE
         pillTimer?.visibility = View.VISIBLE
         pillTimer?.text = "0:00"
@@ -443,6 +458,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         waveform?.visibility = View.GONE
         pillStatus?.text = text
         pillStatus?.visibility = View.VISIBLE
+        pillBusy?.visibility = View.VISIBLE
         pillStop?.visibility = View.GONE
         pillTimer?.visibility = View.GONE
         attachPill()
@@ -569,7 +585,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         val scroll = android.widget.ScrollView(this).apply { addView(list) }
         val sheet = android.widget.LinearLayout(this).apply {
             orientation = android.widget.LinearLayout.VERTICAL
-            background = pill(COLOR_PILL_BG)
+            background = pill(COLOR_PILL_BG).apply { setStroke(maxOf(1, dp.toInt()), COLOR_OUTLINE) }
             addView(header)
             addView(scroll)
             setOnTouchListener { _, ev ->
@@ -655,8 +671,9 @@ class WhisperAccessibilityService : AccessibilityService() {
         feedbackLayoutParams = null
     }
 
-    private fun circle(color: Int) = GradientDrawable().apply {
+    private fun circle(color: Int, outline: Boolean = true) = GradientDrawable().apply {
         shape = GradientDrawable.OVAL; setColor(color)
+        if (outline) setStroke(maxOf(1, dp.toInt()), COLOR_OUTLINE)
     }
 
     private fun pill(color: Int) = GradientDrawable().apply {

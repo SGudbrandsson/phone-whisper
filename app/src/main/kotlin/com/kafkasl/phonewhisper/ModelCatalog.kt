@@ -243,3 +243,22 @@ object ModelCatalog {
 
     private fun JSONArray.strings() = (0 until length()).map { optString(it).lowercase() }
 }
+
+/** Fetches the model list for the current endpoint and caches it in [AppSettings]. */
+object ModelLoader {
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** [done] runs on the main thread. */
+    fun refresh(settings: AppSettings, done: (ModelCatalog.FetchResult) -> Unit) {
+        val base = settings.baseUrl
+        Thread {
+            val result = ModelCatalog.fetchBlocking(base, settings.apiKey)
+            if (result.models != null && Endpoints.normalizeBase(settings.baseUrl) == Endpoints.normalizeBase(base)) {
+                settings.cachedModels = result.models
+            } else if (result.error != null) {
+                Diagnostics.warn("ModelLoader", "GET /models failed: ${result.error}")
+            }
+            main.post { done(result) }
+        }.start()
+    }
+}

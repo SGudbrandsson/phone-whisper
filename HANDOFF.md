@@ -5,37 +5,20 @@ This is Siggi's fork of kafkasl/phone-whisper, an Android floating-bubble dictat
 app for Android. It sends audio to an OpenAI-compatible endpoint, falls back to an
 on-device model when offline, and keeps a history.
 
-## Status: the app crashes on record. Fix this first.
+## Status (2026-09-30)
 
-Tapping the bubble to record crashes the accessibility service every time, so nothing
-records and nothing reaches history. Siggi confirmed this on his phone.
+The record crash is fixed (pill `updateViewLayout` ran before `addView`) and covered by
+`OverlayFlowTest`, which drives the real service under Robolectric. Since then the branch
+gained in-app crash reports (`Diagnostics`, `DiagnosticsActivity`), a `/models` picker
+(`ModelCatalog`, including LiteLLM `/model/info`), multilingual offline Whisper Turbo, and
+a Compose/Material 3 UI (`ui/`). Screenshots: `./gradlew testDebugUnitTest` writes PNGs to
+`app/build/outputs/roborazzi/` (`ScreenshotTest`, `OverlayScreenshotTest`).
 
-**Cause** (`WhisperAccessibilityService.kt`, `attachPill()` / `updatePillPosition()`):
+Siggi uses a LiteLLM proxy to ElevenLabs Scribe (plain `/audio/transcriptions`), so the
+chat-completions `input_audio` path was not built.
 
-```kotlin
-private fun attachPill() {
-    val pill = pillView ?: return
-    if (!pillShown) {
-        pillShown = true          // set BEFORE addView...
-        updatePillPosition()      // ...so this calls wm.updateViewLayout(pill, ...) on a view
-        wm.addView(pill, pillParams) // that isn't attached yet -> IllegalArgumentException
-    }
-}
-```
-
-**Fix:** call `updatePillPosition()` while `pillShown` is still false, which only
-computes the params. Then `addView`, then set `pillShown = true`. After that, audit
-every `addView`, `removeView` and `updateViewLayout` in the service for the same pattern
-(the feedback view, the quick-history sheet, and `setBubbleVisible`).
-
-**Add a regression test for the whole flow.** Use Robolectric, which is already a test
-dependency. It runs real `WindowManagerGlobal` code, so this class of bug should
-reproduce there. Build the service, call `onServiceConnected()`, grant `RECORD_AUDIO`
-(ShadowApplication), use Robolectric's `ShadowAudioRecord`, then drive a tap to record,
-a tap to stop, and a cancel. If `TYPE_ACCESSIBILITY_OVERLAY` or `rootInActiveWindow`
-gets in the way under Robolectric, factor the overlay into a class that takes a
-`WindowManager` and test that instead. There is no emulator in the cloud sandbox
-(no `/dev/kvm`), so JVM tests are the only on-machine check.
+Still open: a history entry can be written if cancel lands between the success callback's
+session check and the write; offline Whisper is decoded in fixed 28 s chunks (no VAD).
 
 ## What's on the branch (7 commits on top of upstream `e6518cd`)
 
