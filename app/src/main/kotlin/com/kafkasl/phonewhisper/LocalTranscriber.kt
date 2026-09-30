@@ -49,12 +49,12 @@ class LocalTranscriber private constructor(
         fun create(ctx: Context, modelName: String): LocalTranscriber? {
             val modelDir = File(ctx.filesDir, "models/$modelName")
             if (!modelDir.exists()) {
-                Log.e(TAG, "Model dir not found: $modelDir")
+                Diagnostics.error(TAG, "Model dir not found: $modelDir")
                 return null
             }
 
             val config = detectModelConfig(modelDir) ?: run {
-                Log.e(TAG, "Could not detect model type in $modelDir")
+                Diagnostics.error(TAG, "Could not detect model type in $modelDir")
                 return null
             }
 
@@ -63,7 +63,7 @@ class LocalTranscriber private constructor(
                 Log.i(TAG, "Loaded model: $modelName")
                 LocalTranscriber(recognizer, modelName)
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to load model: ${e.message}")
+                Diagnostics.error(TAG, "Failed to load model $modelName", e)
                 null
             }
         }

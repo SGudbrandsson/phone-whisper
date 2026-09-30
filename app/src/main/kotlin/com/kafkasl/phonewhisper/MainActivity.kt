@@ -25,6 +25,7 @@ import java.io.File
 class MainActivity : AppCompatActivity() {
 
     private lateinit var statusSubtitle: TextView
+    private lateinit var crashBanner: View
     private lateinit var audioRowSub: TextView
     private lateinit var accRowSub: TextView
     private lateinit var keyRowSub: TextView
@@ -70,6 +71,9 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(24), dp(64), dp(24), dp(24))
         }
         root.addView(header)
+
+        crashBanner = buildCrashBanner()
+        root.addView(crashBanner)
 
         // Status row
         val statusRow = settingsRow("Status", "Checking...")
@@ -126,6 +130,12 @@ class MainActivity : AppCompatActivity() {
                 .show()
         })
         root.addView(historyDetails)
+
+        // --- Diagnostics Section ---
+        root.addView(sectionHeader("Diagnostics"))
+        root.addView(settingsRow("Crash reports & diagnostics", "Copy or share logs when something goes wrong") {
+            startActivity(Intent(this, DiagnosticsActivity::class.java))
+        })
 
         // --- Engine Section ---
         root.addView(sectionHeader("Transcription"))
@@ -209,7 +219,49 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
-    override fun onResume() { super.onResume(); refresh() }
+    override fun onResume() {
+        super.onResume()
+        refresh()
+        crashBanner.visibility = if (Diagnostics.hasUnseenCrash(this)) View.VISIBLE else View.GONE
+    }
+
+    /** "Crashed last time" notice with View / Dismiss. */
+    private fun buildCrashBanner(): View {
+        val banner = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(8), dp(4))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(16).toFloat()
+                setColor(attrColor(com.google.android.material.R.attr.colorErrorContainer))
+            }
+            layoutParams = LinearLayout.LayoutParams(LP_MATCH, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                setMargins(dp(16), 0, dp(16), dp(12))
+            }
+            visibility = View.GONE
+        }
+        val onColor = attrColor(com.google.android.material.R.attr.colorOnErrorContainer)
+        banner.addView(TextView(this).apply {
+            text = "Phone Whisper crashed last time"
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(onColor)
+        })
+        banner.addView(TextView(this).apply {
+            text = "A crash report was saved. View it to copy or share."
+            textSize = 14f
+            setTextColor(onColor)
+        })
+        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END }
+        fun action(label: String, onClick: () -> Unit) = MaterialButton(this, null, com.google.android.material.R.attr.borderlessButtonStyle).apply {
+            text = label
+            setTextColor(onColor)
+            setOnClickListener { onClick() }
+        }
+        actions.addView(action("Dismiss") { Diagnostics.markCrashesSeen(this); banner.visibility = View.GONE })
+        actions.addView(action("View") { startActivity(Intent(this, DiagnosticsActivity::class.java)) })
+        banner.addView(actions)
+        return banner
+    }
     override fun onRequestPermissionsResult(c: Int, p: Array<String>, r: IntArray) {
         super.onRequestPermissionsResult(c, p, r); refresh()
     }

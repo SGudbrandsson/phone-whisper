@@ -234,7 +234,7 @@ object HistoryActions {
                     is TranscriptionEngine.Outcome.Failure -> store.updateError(entry.id, outcome.error)
                 }
             } catch (e: Exception) {
-                android.util.Log.e("HistoryActions", "Could not update history entry", e)
+                Diagnostics.error("HistoryActions", "Could not update history entry", e)
             }
             done(outcome) // always report back, even if the history update failed
         }

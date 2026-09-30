@@ -117,6 +117,7 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     public override fun onServiceConnected() { // public so tests can drive it
         instance = this
+        Diagnostics.info(TAG, "Accessibility service connected")
         showOverlay()
         refreshVisibility()
         // The keyboard/focus events around unlocking can arrive while still "locked"; re-check after unlock.
@@ -865,7 +866,7 @@ class WhisperAccessibilityService : AccessibilityService() {
     private inline fun safely(what: String, block: () -> Unit): Boolean = try {
         block(); true
     } catch (e: Exception) {
-        Log.e(TAG, "Failed to $what", e); false
+        Diagnostics.error(TAG, "Failed to $what", e); false
     }
 
     private fun releaseRecorder() {
@@ -1036,5 +1037,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun toast(msg: String) { handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() } }
+    private fun toast(msg: String) {
+        Diagnostics.warn(TAG, msg) // every toast here reports a problem
+        handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+    }
 }

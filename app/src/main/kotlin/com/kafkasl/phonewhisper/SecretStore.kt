@@ -34,7 +34,7 @@ class SecretStore(private val prefs: SharedPreferences) {
             String(cipher.doFinal(blob, IV_BYTES, blob.size - IV_BYTES), Charsets.UTF_8)
         } catch (e: Exception) {
             // Keystore key lost (e.g. restored to a new device): the value can't be recovered.
-            Log.w("SecretStore", "Could not decrypt $name: ${e.message}")
+            Diagnostics.warn("SecretStore", "Could not decrypt $name: ${e.message}")
             null
         }
     }

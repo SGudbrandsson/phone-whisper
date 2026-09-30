@@ -42,7 +42,12 @@ class TranscriptionEngine(private val ctx: Context) {
         val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
         val finish: (Outcome) -> Unit = { outcome ->
             if (!job.cancelled && delivered.compareAndSet(false, true)) {
-                try { done(outcome) } catch (e: Exception) { Log.e(TAG, "Outcome handler failed", e) }
+                when (outcome) {
+                    is Outcome.Failure -> Diagnostics.warn(TAG, "Transcription failed: ${outcome.error}")
+                    is Outcome.Success -> Diagnostics.info(TAG, "Transcribed via ${outcome.source.label}" +
+                        (outcome.note?.let { " ($it)" } ?: ""))
+                }
+                try { done(outcome) } catch (e: Exception) { Diagnostics.error(TAG, "Outcome handler failed", e) }
             }
         }
 
@@ -64,7 +69,7 @@ class TranscriptionEngine(private val ctx: Context) {
                     is TranscriptionRouter.Plan.Unavailable -> finish(Outcome.Failure(plan.reason))
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Transcription failed to start", e)
+                Diagnostics.error(TAG, "Transcription failed to start", e)
                 finish(Outcome.Failure(e.message ?: "Transcription failed"))
             }
         }
@@ -81,7 +86,7 @@ class TranscriptionEngine(private val ctx: Context) {
                 job.cancelled -> Unit
                 !result.text.isNullOrBlank() -> cleanup(result.text.trim(), Source.CLOUD, job, finish)
                 result.networkFailure && fallbackToLocal -> {
-                    Log.i(TAG, "Cloud unreachable (${result.error}); falling back to local")
+                    Diagnostics.warn(TAG, "Cloud unreachable (${result.error}); falling back to local")
                     onStatus("Offline — local model…")
                     runLocal(pcm, Source.LOCAL_FALLBACK, job, finish)
                 }
@@ -107,7 +112,7 @@ class TranscriptionEngine(private val ctx: Context) {
                 if (text.isBlank()) finish(Outcome.Failure("No speech detected"))
                 else cleanup(text, source, job, finish)
             } catch (e: Exception) {
-                Log.e(TAG, "Local transcription failed", e)
+                Diagnostics.error(TAG, "Local transcription failed", e)
                 finish(Outcome.Failure("Local error: ${e.message}"))
             }
         }
@@ -134,7 +139,10 @@ class TranscriptionEngine(private val ctx: Context) {
             job.call = null
             if (job.cancelled) return@process
             if (!result.text.isNullOrBlank()) finish(Outcome.Success(result.text, text, source, null))
-            else finish(Outcome.Success(text, text, source, "Cleanup failed — raw text used"))
+            else {
+                Diagnostics.warn(TAG, "Cleanup failed: ${result.error}")
+                finish(Outcome.Success(text, text, source, "Cleanup failed — raw text used"))
+            }
         }
     }
 
