@@ -13,6 +13,7 @@ import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -34,6 +35,14 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     companion object {
         var instance: WhisperAccessibilityService? = null
+
+        /** Accessibility events the service needs for the show-only-when-typing setting. */
+        internal fun eventTypesFor(onlyWhenTyping: Boolean, sdk: Int): Int = when {
+            !onlyWhenTyping -> 0
+            sdk >= 33 -> AccessibilityEvent.TYPE_WINDOWS_CHANGED // input-method hooks do the rest
+            else -> AccessibilityEvent.TYPE_WINDOWS_CHANGED or AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        }
         private const val TAG = "PhoneWhisper"
         private const val SAMPLE_RATE = 16000
         private const val BTN_DP = 44
@@ -56,8 +65,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val PILL_W_DP = 216
         private const val PILL_GAP_DP = 6
         private const val QUICK_HISTORY_COUNT = 10
-        private const val VISIBILITY_DEBOUNCE_MS = 120L
-        private const val HIDE_DELAY_MS = 600L
+        private const val HIDE_DELAY_MS = 150L
         /** 10 minutes of 16 kHz 16-bit mono; keeps uploads under the common 25 MB API limit. */
         private const val MAX_RECORDING_BYTES = 10 * 60 * 16000 * 2
     }
@@ -141,30 +149,75 @@ class WhisperAccessibilityService : AccessibilityService() {
     // --- Show only when typing ---
 
     private var bubbleVisible = true
+    private val typing = TypingSignals()
     private val unlockReceiver = object : android.content.BroadcastReceiver() {
         override fun onReceive(c: Context?, i: android.content.Intent?) {
-            if (overlayView != null) handler.postDelayed(evaluateVisibility, 300)
+            if (overlayView != null) { typing.imeVisible = queryImeVisible(); requestEvaluate() }
         }
     }
-    private val evaluateVisibility = Runnable { applyVisibility(computeTypingState()) }
+    private var evaluatePosted = false
+    private val evaluateVisibility = Runnable { evaluatePosted = false; applyVisibility(computeTypingState()) }
     private val hideBubbleNow = Runnable {
         if (state == State.IDLE && sheetView == null && !computeTypingState()) setBubbleVisible(false)
     }
+    /** Re-checks after an editor started but no keyboard showed up (one-shot, not a poll). */
+    private val keyboardTimeout = Runnable { requestEvaluate() }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (!settings.showOnlyWhenTyping) return
-        // Coalesce bursts of focus/window events into one check.
-        handler.removeCallbacks(evaluateVisibility)
-        handler.postDelayed(evaluateVisibility, VISIBILITY_DEBOUNCE_MS)
+    /** Coalesces a burst of callbacks into one check on the next main-loop turn: no fixed delay. */
+    private fun requestEvaluate() {
+        if (evaluatePosted) return
+        evaluatePosted = true
+        handler.post(evaluateVisibility)
     }
 
-    /** True when the keyboard is on screen or an editable field has input focus. */
+    /**
+     * Android 13+: called by the system whenever any text field gains or loses input, before the
+     * keyboard animates in. This is what makes the bubble appear instantly.
+     */
+    @androidx.annotation.RequiresApi(33)
+    override fun onCreateInputMethod(): android.accessibilityservice.InputMethod =
+        object : android.accessibilityservice.InputMethod(this) {
+            override fun onStartInput(attribute: android.view.inputmethod.EditorInfo, restarting: Boolean) {
+                super.onStartInput(attribute, restarting)
+                val pkg = attribute.packageName
+                handler.post {
+                    typing.onStartInput(pkg, SystemClock.uptimeMillis())
+                    handler.removeCallbacks(keyboardTimeout)
+                    handler.postDelayed(keyboardTimeout, TypingSignals.KEYBOARD_WAIT_MS)
+                    requestEvaluate()
+                }
+            }
+
+            override fun onFinishInput() {
+                super.onFinishInput()
+                handler.post { typing.onFinishInput(); requestEvaluate() }
+            }
+        }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        event ?: return
+        if (!onlyWhenTyping) return
+        when (event.eventType) {
+            // The keyboard window appearing or going away is the main hide signal.
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> typing.imeVisible = queryImeVisible()
+            // Pre-13 fallback only; on 13+ this event type isn't subscribed.
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> if (event.packageName == packageName) return
+        }
+        requestEvaluate()
+    }
+
+    private fun queryImeVisible(): Boolean = try {
+        windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+    } catch (_: Exception) { false }
+
+    private val usesInputMethodHooks get() = android.os.Build.VERSION.SDK_INT >= 33
+
+    /** True while the keyboard is up, or an editor just started and its keyboard is on the way. */
     private fun computeTypingState(): Boolean {
         if (isLocked()) return false // never offer dictation on the lock screen (PIN/password fields)
-        val imeVisible = try {
-            windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }
-        } catch (_: Exception) { false }
-        if (imeVisible) return true
+        if (usesInputMethodHooks) return typing.isTyping(SystemClock.uptimeMillis(), packageName)
+        if (typing.imeVisible) return true
+        // Android 11-12: no input-method hooks, so look for a focused editable field.
         val root = rootInActiveWindow ?: return false
         return try {
             if (root.packageName == packageName) return false // our own settings screen
@@ -175,13 +228,13 @@ class WhisperAccessibilityService : AccessibilityService() {
     }
 
     private fun applyVisibility(typing: Boolean) {
-        val keepVisible = !settings.showOnlyWhenTyping || typing ||
+        val keepVisible = !onlyWhenTyping || typing ||
             state != State.IDLE || sheetView != null
         if (keepVisible) {
             handler.removeCallbacks(hideBubbleNow)
             setBubbleVisible(true)
         } else if (bubbleVisible) {
-            // Short grace period so moving between fields doesn't flicker the bubble.
+            // Brief grace so moving between fields (finish -> start input) doesn't flicker.
             handler.removeCallbacks(hideBubbleNow)
             handler.postDelayed(hideBubbleNow, HIDE_DELAY_MS)
         }
@@ -199,8 +252,26 @@ class WhisperAccessibilityService : AccessibilityService() {
         (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(view, params)
     }
 
+    /** Cached so the event handler doesn't read preferences per event. */
+    private var onlyWhenTyping = true
+
+    /**
+     * Subscribes only to the events the current setting needs. Every subscribed type makes
+     * every app on the phone generate and send those events, so this matters for battery.
+     */
+    private fun configureEvents() {
+        onlyWhenTyping = settings.showOnlyWhenTyping
+        val info = serviceInfo ?: return
+        info.eventTypes = eventTypesFor(onlyWhenTyping, android.os.Build.VERSION.SDK_INT)
+        serviceInfo = info
+    }
+
     /** Called from settings when the show-only-when-typing option changes. */
-    fun refreshVisibility() = handler.post { applyVisibility(computeTypingState()) }
+    fun refreshVisibility() = handler.post {
+        configureEvents()
+        typing.imeVisible = queryImeVisible()
+        applyVisibility(computeTypingState())
+    }
     override fun onInterrupt() {}
 
     override fun onDestroy() {
@@ -212,6 +283,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         currentJob = null
         releaseRecorder()
         pcmStream = null
+        stopPulse() // an infinite animator would keep requesting frames after the views are gone
         removeOverlay()
         thread { engine.unloadLocalModel() }
         super.onDestroy()
@@ -662,6 +734,7 @@ class WhisperAccessibilityService : AccessibilityService() {
         handler.removeCallbacks(tickTimer)
         handler.removeCallbacks(evaluateVisibility)
         handler.removeCallbacks(hideBubbleNow)
+        handler.removeCallbacks(keyboardTimeout)
         if (pillShown) pillView?.let { wm.removeView(it) }
         pillShown = false
         pillView = null
@@ -776,7 +849,9 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
 
         session++
-        targetPackage = rootInActiveWindow?.let { root -> root.packageName?.toString().also { root.recycle() } }
+        // On 13+ the input-method hook already knows the app; skip fetching the view tree.
+        targetPackage = typing.activeInputPackage
+            ?: rootInActiveWindow?.let { root -> root.packageName?.toString().also { root.recycle() } }
         val stream = ByteArrayOutputStream()
         pcmStream = stream
         val recorder = audioRecord!!
@@ -914,6 +989,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
         feedback?.let { showFeedback(it, feedbackDurationMs) }
 
+        if (commitViaInputMethod(text)) return
+
         val candidates = findInjectionCandidates()
         Log.i(TAG, "Injecting text into ${candidates.size} candidate node(s)")
 
@@ -930,6 +1007,26 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
 
         Log.i(TAG, if (injected) "Text injection action reported success" else "No injection action succeeded; clipboard fallback only")
+    }
+
+    /**
+     * Android 13+: types straight into the focused field through the accessibility input
+     * connection, like a keyboard would. No tree walk and no paste. Returns false when no
+     * editor has input, so the node-based fallback runs.
+     */
+    private fun commitViaInputMethod(text: String): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < 33) return false
+        val pkg = typing.activeInputPackage ?: return false
+        if (pkg == packageName) return false
+        val connection = inputMethod?.currentInputConnection ?: return false
+        return try {
+            connection.commitText(text, 1, null)
+            Log.i(TAG, "Committed text through the input connection ($pkg)")
+            true
+        } catch (e: Exception) {
+            Diagnostics.warn(TAG, "commitText failed, falling back to paste", e)
+            false
+        }
     }
 
     private fun findInjectionCandidates(): List<AccessibilityNodeInfo> {

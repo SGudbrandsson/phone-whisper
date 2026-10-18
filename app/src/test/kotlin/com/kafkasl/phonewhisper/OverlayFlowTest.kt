@@ -8,6 +8,8 @@ import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
+import android.view.accessibility.AccessibilityEvent
+import android.view.inputmethod.EditorInfo
 import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
 import okhttp3.mockwebserver.MockResponse
@@ -200,6 +202,40 @@ class OverlayFlowTest {
         service.refreshVisibility()
         idle()
         assertEquals(View.VISIBLE, service.overlayView!!.visibility)
+    }
+
+    @Test fun `subscribes to window changes only, and to nothing when always shown`() {
+        assertEquals(AccessibilityEvent.TYPE_WINDOWS_CHANGED, WhisperAccessibilityService.eventTypesFor(true, 33))
+        assertEquals(0, WhisperAccessibilityService.eventTypesFor(false, 33))
+        assertEquals(0, WhisperAccessibilityService.eventTypesFor(false, 30))
+        assertTrue("Android 11-12 still needs focus events",
+            WhisperAccessibilityService.eventTypesFor(true, 30) and AccessibilityEvent.TYPE_VIEW_FOCUSED != 0)
+    }
+
+    @Test fun `input method hooks show the bubble instantly and hide it after input ends`() {
+        AppSettings(app).showOnlyWhenTyping = true
+        service.refreshVisibility()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(2))
+        assertEquals(View.GONE, service.overlayView!!.visibility)
+
+        val ime = service.onCreateInputMethod()
+        ime.onStartInput(EditorInfo().apply { packageName = "com.slack" }, false)
+        shadowOf(Looper.getMainLooper()).idle() // no clock advance: must not wait on a timer
+        assertEquals(View.VISIBLE, service.overlayView!!.visibility)
+
+        ime.onFinishInput()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(200))
+        assertEquals(View.GONE, service.overlayView!!.visibility)
+    }
+
+    @Test fun `editor without a keyboard hides after the wait`() {
+        AppSettings(app).showOnlyWhenTyping = true
+        service.refreshVisibility(); idle()
+        service.onCreateInputMethod().onStartInput(EditorInfo().apply { packageName = "com.slack" }, false)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(View.VISIBLE, service.overlayView!!.visibility)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(TypingSignals.KEYBOARD_WAIT_MS + 300))
+        assertEquals(View.GONE, service.overlayView!!.visibility)
     }
 
     @Test fun `no microphone permission shows a toast instead of recording`() {
