@@ -140,6 +140,25 @@ class ScreenshotTest {
         HistoryScreen(HistoryUiState(loaded = true, retentionDays = 0), {}, {}, { _, _ -> }, {}, {}, {}, {})
     }
 
+    @Test fun dictionary_light() = shot("dictionary_light") {
+        com.kafkasl.phonewhisper.ui.DictionaryScreen(
+            com.kafkasl.phonewhisper.ui.DictionaryUiState(
+                entries = listOf(
+                    VocabEntry("AIHub", listOf("ai hub", "eye hub")), VocabEntry("Siggi"),
+                    VocabEntry("Þórunn", listOf("thorunn", "tórunn")), VocabEntry("LiteLLM", listOf("light llm", "lite l l m")),
+                    VocabEntry("Clockwork"),
+                ),
+                sendHints = true, hintsRejectedFor = "elevenlabs/scribe_v2",
+            ),
+            onBack = {}, onSave = { _, _ -> }, onDelete = {}, onSendHints = {}, onRetryHints = {},
+        )
+    }
+
+    @Test fun dictionary_empty_dark() = shot("dictionary_empty_dark", dark = true) {
+        com.kafkasl.phonewhisper.ui.DictionaryScreen(com.kafkasl.phonewhisper.ui.DictionaryUiState(),
+            onBack = {}, onSave = { _, _ -> }, onDelete = {}, onSendHints = {}, onRetryHints = {})
+    }
+
     @Test fun diagnostics_light() = shot("diagnostics_light") {
         DiagnosticsScreen(
             report = "=== Phone Whisper diagnostics ===\nGenerated: 2026-09-30 10:31:02.114 +0000\nApp: com.kafkasl.phonewhisper 0.3.0 (2)\n" +

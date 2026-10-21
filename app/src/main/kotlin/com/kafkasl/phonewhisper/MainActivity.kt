@@ -50,6 +50,7 @@ class MainActivity : ComponentActivity() {
             SettingsEvent.OpenAccessibility -> startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
             SettingsEvent.OpenHistory -> startActivity(Intent(this, HistoryActivity::class.java))
             SettingsEvent.OpenDiagnostics -> startActivity(Intent(this, DiagnosticsActivity::class.java))
+            SettingsEvent.OpenDictionary -> startActivity(Intent(this, DictionaryActivity::class.java))
             SettingsEvent.ViewCrash -> { vm.onEvent(e); startActivity(Intent(this, DiagnosticsActivity::class.java)) }
             else -> vm.onEvent(e)
         }

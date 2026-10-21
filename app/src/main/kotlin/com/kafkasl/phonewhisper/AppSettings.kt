@@ -92,6 +92,27 @@ class AppSettings(private val ctx: Context) {
         get() = prefs.getBoolean(KEY_ONLY_WHEN_TYPING, true)
         set(value) { prefs.edit().putBoolean(KEY_ONLY_WHEN_TYPING, value).apply() }
 
+    /** The user's dictionary (spelling hints and corrections). */
+    var vocabulary: List<VocabEntry>
+        get() = Vocabulary.fromJson(prefs.getString(KEY_VOCAB, null))
+        set(value) { prefs.edit().putString(KEY_VOCAB, Vocabulary.toJson(value)).apply() }
+
+    /** Send dictionary words to the cloud model as hints (local corrections always apply). */
+    var sendVocabularyHints: Boolean
+        get() = prefs.getBoolean(KEY_VOCAB_HINTS, true)
+        set(value) { prefs.edit().putBoolean(KEY_VOCAB_HINTS, value).apply() }
+
+    private fun hintKey() = Endpoints.normalizeBase(baseUrl) + "|" + sttModel
+
+    /** True after this endpoint+model rejected the `prompt` field; it isn't sent there again. */
+    var hintsRejectedHere: Boolean
+        get() = hintKey() in (prefs.getStringSet(KEY_HINTS_REJECTED, emptySet()) ?: emptySet())
+        set(value) {
+            val set = (prefs.getStringSet(KEY_HINTS_REJECTED, emptySet()) ?: emptySet()).toMutableSet()
+            if (value) set += hintKey() else set -= hintKey()
+            prefs.edit().putStringSet(KEY_HINTS_REJECTED, set).apply()
+        }
+
     /** Last `GET /models` result for the current endpoint; empty if none or the endpoint changed. */
     var cachedModels: List<RemoteModel>
         get() = if (prefs.getString(KEY_MODELS_BASE, null) == Endpoints.normalizeBase(baseUrl))
@@ -101,7 +122,10 @@ class AppSettings(private val ctx: Context) {
                 .putString(KEY_MODELS, ModelCatalog.toJson(value)).apply()
         }
 
-    fun cloudConfig() = TranscriberClient.Config(baseUrl, apiKey, sttModel, language)
+    fun cloudConfig(withHints: Boolean = true) = TranscriberClient.Config(
+        baseUrl, apiKey, sttModel, language,
+        prompt = if (withHints && sendVocabularyHints && !hintsRejectedHere) Vocabulary.hintPrompt(vocabulary) else null,
+    )
 
     companion object {
         const val PREFS_NAME = "phonewhisper"
@@ -117,6 +141,9 @@ class AppSettings(private val ctx: Context) {
         private const val KEY_HISTORY_ENABLED = "history_enabled"
         private const val KEY_RETENTION_DAYS = "history_retention_days"
         private const val KEY_ONLY_WHEN_TYPING = "show_only_when_typing"
+        private const val KEY_VOCAB = "vocabulary"
+        private const val KEY_VOCAB_HINTS = "vocabulary_hints"
+        private const val KEY_HINTS_REJECTED = "vocabulary_hints_rejected"
         private const val KEY_MODELS = "models_cache"
         private const val KEY_MODELS_BASE = "models_cache_base"
         private const val LEGACY_USE_LOCAL = "use_local"

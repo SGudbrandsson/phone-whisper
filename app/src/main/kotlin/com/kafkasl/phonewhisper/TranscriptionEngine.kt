@@ -81,14 +81,27 @@ class TranscriptionEngine(private val ctx: Context) {
         onStatus: (String) -> Unit, finish: (Outcome) -> Unit,
     ) {
         val wav = WavWriter.encode(pcm)
+        sendCloud(pcm, wav, settings.cloudConfig(), fallbackToLocal, job, onStatus, finish)
+    }
+
+    private fun sendCloud(
+        pcm: ByteArray, wav: ByteArray, config: TranscriberClient.Config, fallbackToLocal: Boolean, job: Job,
+        onStatus: (String) -> Unit, finish: (Outcome) -> Unit,
+    ) {
         val t0 = System.currentTimeMillis()
-        TranscriberClient.transcribe(wav, settings.cloudConfig(), onCall = { job.call = it; if (job.cancelled) it.cancel() }) { result ->
+        TranscriberClient.transcribe(wav, config, onCall = { job.call = it; if (job.cancelled) it.cancel() }) { result ->
             job.call = null
             // Upload + server time, to see where dictation latency goes (diagnostics report).
             Diagnostics.info(TAG, "Cloud request: ${System.currentTimeMillis() - t0} ms for " +
                 "${pcm.size / 2 / SAMPLE_RATE.toFloat()} s audio (${wav.size / 1024} KB upload)")
             when {
                 job.cancelled -> Unit
+                config.prompt != null && result.looksLikeParamRejection -> {
+                    // Don't let the dictionary break dictation: drop the hints here from now on.
+                    Diagnostics.warn(TAG, "Server refused dictionary hints (${result.error}); retrying without them")
+                    settings.hintsRejectedHere = true
+                    sendCloud(pcm, wav, config.copy(prompt = null), fallbackToLocal, job, onStatus, finish)
+                }
                 !result.text.isNullOrBlank() -> cleanup(result.text.trim(), Source.CLOUD, job, finish)
                 result.networkFailure && fallbackToLocal -> {
                     Diagnostics.warn(TAG, "Cloud unreachable (${result.error}); falling back to local")
@@ -128,27 +141,31 @@ class TranscriptionEngine(private val ctx: Context) {
     private fun transcribeWithLocalModel(samples: FloatArray): String? =
         obtainLocalModel()?.transcribe(samples, SAMPLE_RATE)
 
-    private fun cleanup(text: String, source: Source, job: Job, finish: (Outcome) -> Unit) {
-        if (!settings.usePostProcessing) return finish(Outcome.Success(text, text, source, null))
+    /** [raw] is the model's output; dictionary corrections are applied before and after cleanup. */
+    private fun cleanup(raw: String, source: Source, job: Job, finish: (Outcome) -> Unit) {
+        val vocab = settings.vocabulary
+        val text = Vocabulary.apply(raw, vocab)
+        if (!settings.usePostProcessing) return finish(Outcome.Success(text, raw, source, null))
 
         // Cleanup needs the network; skip it rather than fail when offline.
         val online = source != Source.LOCAL_FALLBACK && Connectivity.isOnline(ctx)
         val keyMissing = !settings.hasApiKey &&
             Endpoints.normalizeBase(settings.baseUrl) == Endpoints.DEFAULT_BASE_URL
-        if (!online) return finish(Outcome.Success(text, text, source, "Cleanup skipped (offline)"))
-        if (keyMissing) return finish(Outcome.Success(text, text, source, "Cleanup needs an API key"))
+        if (!online) return finish(Outcome.Success(text, raw, source, "Cleanup skipped (offline)"))
+        if (keyMissing) return finish(Outcome.Success(text, raw, source, "Cleanup needs an API key"))
 
         if (job.cancelled) return
         PostProcessor.process(
-            text, settings.postProcessingPrompt, settings.baseUrl, settings.apiKey, settings.chatModel,
+            text, settings.postProcessingPrompt + Vocabulary.cleanupInstruction(vocab).orEmpty(),
+            settings.baseUrl, settings.apiKey, settings.chatModel,
             onCall = { job.call = it; if (job.cancelled) it.cancel() },
         ) { result ->
             job.call = null
             if (job.cancelled) return@process
-            if (!result.text.isNullOrBlank()) finish(Outcome.Success(result.text, text, source, null))
+            if (!result.text.isNullOrBlank()) finish(Outcome.Success(Vocabulary.apply(result.text, vocab), raw, source, null))
             else {
                 Diagnostics.warn(TAG, "Cleanup failed: ${result.error}")
-                finish(Outcome.Success(text, text, source, "Cleanup failed — raw text used"))
+                finish(Outcome.Success(text, raw, source, "Cleanup failed — raw text used"))
             }
         }
     }

@@ -95,6 +95,8 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
             historyOn = settings.historyEnabled,
             retentionDays = settings.retentionDays,
             picker = _state.value.picker,
+            vocabCount = settings.vocabulary.size,
+            vocabHints = settings.sendVocabularyHints && !settings.hintsRejectedHere,
             version = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "" } catch (_: Exception) { "" },
         )
     }
@@ -143,7 +145,8 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
             SettingsEvent.ClearHistory -> thread { HistoryStore.get(ctx).clearAll() }
             SettingsEvent.DismissCrash, SettingsEvent.ViewCrash -> Diagnostics.markCrashesSeen(ctx)
             SettingsEvent.GrantMic, SettingsEvent.OpenAccessibility,
-            SettingsEvent.OpenHistory, SettingsEvent.OpenDiagnostics -> Unit // handled by the Activity
+            SettingsEvent.OpenHistory, SettingsEvent.OpenDiagnostics,
+            SettingsEvent.OpenDictionary -> Unit // handled by the Activity
         }
         refresh()
     }

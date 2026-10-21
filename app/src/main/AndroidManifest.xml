@@ -32,6 +32,11 @@
             android:excludeFromRecents="false" />
 
         <activity
+            android:name=".DictionaryActivity"
+            android:exported="false"
+            android:label="Dictionary" />
+
+        <activity
             android:name=".DiagnosticsActivity"
             android:exported="false"
             android:label="Crash reports &amp; diagnostics" />

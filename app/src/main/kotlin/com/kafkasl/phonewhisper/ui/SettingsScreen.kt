@@ -94,6 +94,16 @@ fun SettingsScreen(
                     SettingsRow("Language", subtitle = languageLabel(state.language),
                         onClick = { dialog = Dialog.LANGUAGE })
                     GroupDivider()
+                    SettingsRow("Dictionary",
+                        subtitle = when {
+                            state.vocabCount == 0 -> "Names and words to spell your way"
+                            else -> "${state.vocabCount} word${if (state.vocabCount == 1) "" else "s"}" +
+                                if (state.vocabHints) " · sent as hints" else " · local fixes only"
+                        },
+                        onClick = { on(SettingsEvent.OpenDictionary) }) {
+                        Icon(Icons.Default.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    GroupDivider()
                     SwitchRow("Show bubble only when typing", state.showOnlyWhenTyping, { on(SettingsEvent.SetOnlyWhenTyping(it)) },
                         subtitle = "Hidden unless the keyboard is up or a text field is focused")
                 }

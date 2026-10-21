@@ -60,6 +60,8 @@ data class SettingsUiState(
     val retentionDays: Int = 7,
     val picker: PickerUi? = null,
     val version: String = "",
+    val vocabCount: Int = 0,
+    val vocabHints: Boolean = true,
 ) {
     val ready get() = micGranted && accessibilityOn && engineReady
     val usesCloud get() = mode != TranscriptionMode.LOCAL_ONLY
@@ -93,4 +95,5 @@ sealed interface SettingsEvent {
     data object ClearHistory : SettingsEvent
     data object OpenHistory : SettingsEvent
     data object OpenDiagnostics : SettingsEvent
+    data object OpenDictionary : SettingsEvent
 }

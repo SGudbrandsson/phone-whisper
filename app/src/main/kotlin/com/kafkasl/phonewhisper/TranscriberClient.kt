@@ -16,6 +16,8 @@ object TranscriberClient {
         val model: String,
         /** ISO-639-1 language code; blank lets the server auto-detect. */
         val language: String = "",
+        /** Spelling hints from the dictionary, sent as the OpenAI-style `prompt` field. */
+        val prompt: String? = null,
     )
 
     /**
@@ -23,7 +25,17 @@ object TranscriberClient {
      * timeout, connection reset, ...). That is the case where falling back to the local
      * model makes sense; an HTTP error such as a bad key is reported instead.
      */
-    data class Result(val text: String?, val error: String?, val networkFailure: Boolean = false)
+    data class Result(val text: String?, val error: String?, val networkFailure: Boolean = false, val httpCode: Int? = null) {
+        /**
+         * True when the server (or a proxy such as LiteLLM) refused an optional parameter, as
+         * LiteLLM does with "UnsupportedParamsError" for providers that lack it.
+         */
+        val looksLikeParamRejection: Boolean get() {
+            if (httpCode != 400 && httpCode != 422) return false
+            val e = error?.lowercase() ?: return false
+            return listOf("prompt", "unsupported", "not supported", "not permitted", "unknown param", "unexpected").any { it in e }
+        }
+    }
 
     // Short connect timeout so a dead Wi-Fi or unreachable server falls back quickly.
     var client: OkHttpClient = OkHttpClient.Builder()
@@ -49,8 +61,8 @@ object TranscriberClient {
         val parsed = parseResponse(body)
         if (code in 200..299) return parsed
         return if (parsed.error != null && body.trimStart().startsWith("{")) {
-            parsed.copy(error = "HTTP $code: ${parsed.error}")
-        } else Result(null, "HTTP $code")
+            parsed.copy(error = "HTTP $code: ${parsed.error}", httpCode = code)
+        } else Result(null, "HTTP $code", httpCode = code)
     }
 
     /**
@@ -76,6 +88,7 @@ object TranscriberClient {
             .setType(MultipartBody.FORM)
             .addFormDataPart("model", config.model)
             .apply { if (config.language.isNotBlank()) addFormDataPart("language", config.language) }
+            .apply { if (!config.prompt.isNullOrBlank()) addFormDataPart("prompt", config.prompt) }
             .addFormDataPart("file", "audio.wav", wavData.toRequestBody("audio/wav".toMediaType()))
             .build()
 
