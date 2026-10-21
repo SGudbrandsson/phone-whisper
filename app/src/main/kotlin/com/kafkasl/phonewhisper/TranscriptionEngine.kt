@@ -80,8 +80,13 @@ class TranscriptionEngine(private val ctx: Context) {
         pcm: ByteArray, fallbackToLocal: Boolean, job: Job,
         onStatus: (String) -> Unit, finish: (Outcome) -> Unit,
     ) {
-        TranscriberClient.transcribe(WavWriter.encode(pcm), settings.cloudConfig(), onCall = { job.call = it; if (job.cancelled) it.cancel() }) { result ->
+        val wav = WavWriter.encode(pcm)
+        val t0 = System.currentTimeMillis()
+        TranscriberClient.transcribe(wav, settings.cloudConfig(), onCall = { job.call = it; if (job.cancelled) it.cancel() }) { result ->
             job.call = null
+            // Upload + server time, to see where dictation latency goes (diagnostics report).
+            Diagnostics.info(TAG, "Cloud request: ${System.currentTimeMillis() - t0} ms for " +
+                "${pcm.size / 2 / SAMPLE_RATE.toFloat()} s audio (${wav.size / 1024} KB upload)")
             when {
                 job.cancelled -> Unit
                 !result.text.isNullOrBlank() -> cleanup(result.text.trim(), Source.CLOUD, job, finish)
@@ -97,6 +102,7 @@ class TranscriptionEngine(private val ctx: Context) {
     }
 
     private fun runLocal(pcm: ByteArray, source: Source, job: Job, finish: (Outcome) -> Unit) {
+        main.removeCallbacks(idleUnload) // in use again: keep it loaded
         thread {
             try {
                 val samples = pcmToFloat(pcm)
@@ -109,6 +115,7 @@ class TranscriptionEngine(private val ctx: Context) {
                     transcribeWithLocalModel(samples) ?: return@thread finish(Outcome.Failure("Local model could not be loaded"))
                 }
                 Log.i(TAG, "Local transcription: ${System.currentTimeMillis() - t0}ms, ${samples.size / SAMPLE_RATE}s audio")
+                scheduleIdleUnload()
                 if (text.isBlank()) finish(Outcome.Failure("No speech detected"))
                 else cleanup(text, source, job, finish)
             } catch (e: Exception) {
@@ -159,7 +166,26 @@ class TranscriptionEngine(private val ctx: Context) {
         local
     }
 
-    fun unloadLocalModel() = synchronized(modelLock) {
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+    private val idleUnload = Runnable {
+        if (settings.mode != TranscriptionMode.LOCAL_ONLY) thread { unloadLocalModel(); Log.i(TAG, "Unloaded idle fallback model") }
+    }
+
+    /**
+     * A model loaded as an offline fallback is freed after [IDLE_UNLOAD_MS] without use, so it
+     * doesn't hold memory all day after one dead-Wi-Fi moment. Local-only mode keeps it loaded
+     * so dictation stays fast.
+     */
+    private fun scheduleIdleUnload() {
+        main.removeCallbacks(idleUnload)
+        if (settings.mode != TranscriptionMode.LOCAL_ONLY) main.postDelayed(idleUnload, IDLE_UNLOAD_MS)
+    }
+
+    /** True while a local model is in memory (for tests and diagnostics). */
+    val isLocalModelLoaded get() = local != null
+
+    fun unloadLocalModel(): Unit = synchronized(modelLock) {
+        main.removeCallbacks(idleUnload)
         local?.release()
         local = null
     }
@@ -167,6 +193,7 @@ class TranscriptionEngine(private val ctx: Context) {
     companion object {
         private const val TAG = "TranscriptionEngine"
         const val SAMPLE_RATE = 16000
+        const val IDLE_UNLOAD_MS = 2 * 60 * 1000L
 
         fun pcmToFloat(pcm: ByteArray): FloatArray {
             val samples = FloatArray(pcm.size / 2)

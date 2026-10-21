@@ -12,6 +12,11 @@ package com.kafkasl.phonewhisper
  */
 class TypingSignals {
     var imeVisible = false
+    /**
+     * Set once the system has given us input-method callbacks. From then on input ending hides
+     * the bubble straight away, without waiting for the keyboard's slide-out to finish.
+     */
+    var hooksActive = false
     private var inputActive = false
     private var inputPackage: String? = null
     private var startedAt = 0L
@@ -35,6 +40,7 @@ class TypingSignals {
 
     fun isTyping(now: Long, ownPackage: String): Boolean {
         if (inputActive && inputPackage == ownPackage) return false // our own settings screen
+        if (hooksActive && !inputActive) return false
         if (imeVisible) {
             if (inputActive) keyboardSeenForInput = true
             return true

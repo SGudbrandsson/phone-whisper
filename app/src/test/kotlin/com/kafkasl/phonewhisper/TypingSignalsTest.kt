@@ -46,6 +46,21 @@ class TypingSignalsTest {
         assertNull(t.activeInputPackage)
     }
 
+    @Test fun `with hooks, input ending hides before the keyboard has slid away`() {
+        val t = TypingSignals().apply { hooksActive = true }
+        t.imeVisible = true
+        t.onStartInput("com.slack", now = 0)
+        assertTrue(t.isTyping(now = 10, ownPackage = own))
+        t.onFinishInput() // keyboard window still listed while it animates out
+        assertFalse(t.isTyping(now = 20, ownPackage = own))
+    }
+
+    @Test fun `without hooks the keyboard alone decides`() {
+        val t = TypingSignals()
+        t.imeVisible = true
+        assertTrue(t.isTyping(now = 0, ownPackage = own))
+    }
+
     @Test fun `never shows over our own settings`() {
         val t = TypingSignals()
         t.onStartInput(own, now = 0)

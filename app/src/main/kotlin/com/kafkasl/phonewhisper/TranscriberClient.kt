@@ -57,6 +57,20 @@ object TranscriberClient {
      * Only model, file and (optional) language are sent. JSON is every server's default, and
      * proxies such as LiteLLM reject `response_format` for providers like ElevenLabs.
      */
+    /**
+     * Opens a connection to the endpoint while the user is still speaking, so DNS, TCP and TLS
+     * are done by the time the audio is uploaded. The response doesn't matter.
+     */
+    fun warmUp(baseUrl: String) {
+        try {
+            val req = Request.Builder().url(Endpoints.models(baseUrl)).head().build()
+            client.newCall(req).enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {}
+                override fun onResponse(call: Call, response: Response) = response.close()
+            })
+        } catch (_: IllegalArgumentException) {} // malformed URL: the real request will report it
+    }
+
     fun buildRequest(wavData: ByteArray, config: Config): Request {
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)

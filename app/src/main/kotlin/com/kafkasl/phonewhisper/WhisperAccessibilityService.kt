@@ -65,7 +65,10 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val PILL_W_DP = 216
         private const val PILL_GAP_DP = 6
         private const val QUICK_HISTORY_COUNT = 10
-        private const val HIDE_DELAY_MS = 150L
+        /** Bridges finish -> start input when moving between fields. */
+        private const val HIDE_DELAY_MS = 60L
+        private const val FADE_IN_MS = 120L
+        private const val FADE_OUT_MS = 150L
         /** 10 minutes of 16 kHz 16-bit mono; keeps uploads under the common 25 MB API limit. */
         private const val MAX_RECORDING_BYTES = 10 * 60 * 16000 * 2
     }
@@ -175,8 +178,9 @@ class WhisperAccessibilityService : AccessibilityService() {
      * keyboard animates in. This is what makes the bubble appear instantly.
      */
     @androidx.annotation.RequiresApi(33)
-    override fun onCreateInputMethod(): android.accessibilityservice.InputMethod =
-        object : android.accessibilityservice.InputMethod(this) {
+    override fun onCreateInputMethod(): android.accessibilityservice.InputMethod {
+        typing.hooksActive = true
+        return object : android.accessibilityservice.InputMethod(this) {
             override fun onStartInput(attribute: android.view.inputmethod.EditorInfo, restarting: Boolean) {
                 super.onStartInput(attribute, restarting)
                 val pkg = attribute.packageName
@@ -193,6 +197,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 handler.post { typing.onFinishInput(); requestEvaluate() }
             }
         }
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
@@ -245,11 +250,20 @@ class WhisperAccessibilityService : AccessibilityService() {
         val params = layoutParams ?: return
         if (visible == bubbleVisible) return
         bubbleVisible = visible
-        view.visibility = if (visible) View.VISIBLE else View.GONE
-        // A hidden overlay must not swallow touches meant for the app underneath.
+        // A hidden overlay must not swallow touches meant for the app underneath, so touch is
+        // switched off at the start of the fade, not the end.
         params.flags = if (visible) params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
             else params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(view, params)
+        view.animate().cancel() // a show during a fade-out reverses it from the current alpha
+        if (visible) {
+            view.visibility = View.VISIBLE
+            view.animate().alpha(1f).setDuration(FADE_IN_MS).start()
+        } else {
+            view.animate().alpha(0f).setDuration(FADE_OUT_MS).withEndAction {
+                if (!bubbleVisible) view.visibility = View.GONE
+            }.start()
+        }
     }
 
     /** Cached so the event handler doesn't read preferences per event. */
@@ -860,6 +874,7 @@ class WhisperAccessibilityService : AccessibilityService() {
             toast("Microphone busy"); return
         }
         handler.removeCallbacks(hideBubbleNow)
+        if (settings.mode != TranscriptionMode.LOCAL_ONLY) TranscriberClient.warmUp(settings.baseUrl)
         state = State.RECORDING
         recordStartMs = System.currentTimeMillis()
         setBusy(false)

@@ -14,6 +14,11 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.work.testing.WorkManagerTestInitHelper
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.RecordedRequest
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -41,6 +46,9 @@ class OverlayFlowTest {
     private val app: Application = ApplicationProvider.getApplicationContext()
     private lateinit var service: WhisperAccessibilityService
     private lateinit var server: MockWebServer
+    private val replies = LinkedBlockingQueue<MockResponse>()
+    private val transcriptionRequests = AtomicInteger()
+    private val warmUps = AtomicInteger()
 
     @Before fun setUp() {
         WorkManagerTestInitHelper.initializeTestWorkManager(app)
@@ -67,7 +75,15 @@ class OverlayFlowTest {
         val cm = app.getSystemService(ConnectivityManager::class.java)
         shadowOf(cm).setNetworkCapabilities(cm.activeNetwork,
             ShadowNetworkCapabilities.newInstance().also { shadowOf(it).addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) })
-        server = MockWebServer().also { it.start() }
+        // HEAD = the connection warm-up sent when recording starts; POSTs get the queued replies.
+        server = MockWebServer().apply {
+            dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse =
+                    if (request.method == "HEAD") { warmUps.incrementAndGet(); MockResponse() }
+                    else { transcriptionRequests.incrementAndGet(); replies.poll(5, TimeUnit.SECONDS) ?: MockResponse().setResponseCode(503) }
+            }
+            start()
+        }
         AppSettings(app).apply {
             baseUrl = server.url("/v1").toString() // self-hosted style: no key needed
             mode = TranscriptionMode.CLOUD_ONLY
@@ -88,7 +104,7 @@ class OverlayFlowTest {
     }
 
     @Test fun `tap records, tap stops, text is transcribed and saved`() {
-        server.enqueue(MockResponse().setBody("""{"text":"hello world"}"""))
+        replies.add(MockResponse().setBody("""{"text":"hello world"}"""))
         tapBubble()
         assertEquals(WhisperAccessibilityService.State.RECORDING, service.state)
         assertTrue("pill shown while recording", service.pillView!!.isAttachedToWindow)
@@ -99,11 +115,12 @@ class OverlayFlowTest {
 
         assertFalse("pill hidden after transcription", service.pillView!!.isAttachedToWindow)
         assertEquals("hello world", HistoryStore.get(app).recent().single().text)
-        assertEquals(1, server.requestCount)
+        assertEquals(1, transcriptionRequests.get())
+        assertEquals("connection warmed up when recording started", 1, warmUps.get())
     }
 
     @Test fun `failed transcription returns to idle and keeps audio for retry`() {
-        server.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
+        replies.add(MockResponse().setResponseCode(500).setBody("boom"))
         tapBubble()
         recordFor(1200) // long enough to be worth keeping
         tapBubble()
@@ -124,12 +141,12 @@ class OverlayFlowTest {
         assertEquals(WhisperAccessibilityService.State.IDLE, service.state)
         assertFalse(service.pillView!!.isAttachedToWindow)
         assertEquals("Cancelled", service.feedbackView!!.text.toString())
-        assertEquals(0, server.requestCount)
+        assertEquals(0, transcriptionRequests.get())
         assertTrue(HistoryStore.get(app).recent().isEmpty())
     }
 
     @Test fun `cancel while transcribing ignores the late result`() {
-        server.enqueue(MockResponse().setBody("""{"text":"too late"}""").setHeadersDelay(500, java.util.concurrent.TimeUnit.MILLISECONDS))
+        replies.add(MockResponse().setBody("""{"text":"too late"}""").setHeadersDelay(500, TimeUnit.MILLISECONDS))
         tapBubble()
         recordFor(200)
         tapBubble()
@@ -152,7 +169,7 @@ class OverlayFlowTest {
             cancelButton().performClick()
             idle()
         }
-        server.enqueue(MockResponse().setBody("""{"text":"third"}"""))
+        replies.add(MockResponse().setBody("""{"text":"third"}"""))
         tapBubble()
         recordFor(200)
         tapBubble()
@@ -223,8 +240,8 @@ class OverlayFlowTest {
         shadowOf(Looper.getMainLooper()).idle() // no clock advance: must not wait on a timer
         assertEquals(View.VISIBLE, service.overlayView!!.visibility)
 
-        ime.onFinishInput()
-        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(200))
+        ime.onFinishInput() // hides without waiting for the keyboard window to go away
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(400))
         assertEquals(View.GONE, service.overlayView!!.visibility)
     }
 
