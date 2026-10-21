@@ -56,7 +56,7 @@ import com.kafkasl.phonewhisper.HistoryPolicy
 import com.kafkasl.phonewhisper.R
 import com.kafkasl.phonewhisper.TranscriptionMode
 
-private enum class Dialog { MODE, LANGUAGE, SERVICE, CUSTOM_URL, API_KEY, ELEVEN_KEY, PROMPT, RETENTION, CLEAR_HISTORY }
+private enum class Dialog { ENGINE, LANGUAGE, SERVICE, CUSTOM_URL, API_KEY, ELEVEN_KEY, PROMPT, RETENTION, CLEAR_HISTORY }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -88,11 +88,23 @@ fun SettingsScreen(
             item { StatusCard(state, on) }
 
             item {
-                SettingsGroup("Dictation") {
-                    SettingsRow("Mode", subtitle = state.mode.label, onClick = { dialog = Dialog.MODE })
+                SettingsGroup("Transcription") {
+                    SettingsRow("Engine", subtitle = "${state.engine.title} · ${state.engine.detail}",
+                        onClick = { dialog = Dialog.ENGINE }) {
+                        Icon(Icons.Default.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (state.engine != EngineChoice.ON_DEVICE) {
+                        GroupDivider()
+                        SwitchRow("Use on-device model when offline", state.offlineFallback,
+                            { on(SettingsEvent.SetOfflineFallback(it)) },
+                            subtitle = "Keeps dictation working without a connection")
+                    }
                     GroupDivider()
                     SettingsRow("Language", subtitle = languageLabel(state.language),
                         onClick = { dialog = Dialog.LANGUAGE })
+                    GroupDivider()
+                    SwitchRow("Remove filler words", state.removeFillers, { on(SettingsEvent.SetRemoveFillers(it)) },
+                        subtitle = "Drops \"uh\", \"uhm\", \"öö\". Live also cleans up false starts")
                     GroupDivider()
                     SettingsRow("Dictionary",
                         subtitle = when {
@@ -103,42 +115,14 @@ fun SettingsScreen(
                         onClick = { on(SettingsEvent.OpenDictionary) }) {
                         Icon(Icons.Default.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    GroupDivider()
-                    SwitchRow("Show bubble only when typing", state.showOnlyWhenTyping, { on(SettingsEvent.SetOnlyWhenTyping(it)) },
-                        subtitle = "Hidden unless the keyboard is up or a text field is focused")
                 }
             }
 
-            if (state.showCloud) item {
-                SettingsGroup("Cloud endpoint") {
-                    SettingsRow("Service", subtitle = "${state.serviceName} · ${state.baseUrl}", onClick = { dialog = Dialog.SERVICE })
-                    GroupDivider()
-                    SettingsRow("API key",
-                        subtitle = state.apiKeyHint?.let { "$it · stored encrypted" } ?: "Not set",
-                        onClick = { dialog = Dialog.API_KEY })
-                    if (state.usesCloud) {
-                        GroupDivider()
-                        SettingsRow("Transcription model", subtitle = state.sttModel,
-                            onClick = { on(SettingsEvent.OpenPicker(PickerTarget.TRANSCRIPTION)) }) {
-                            Icon(Icons.Default.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                    GroupDivider()
-                    SwitchRow("Compress uploads", state.compressAudio, { on(SettingsEvent.SetCompress(it)) },
-                        subtitle = "Opus audio, about 10× smaller than WAV. Falls back to WAV if the server can't read it")
-                    GroupDivider()
-                    ConnectionRow(state, on)
-                }
-            }
-
-            if (state.usesCloud) item {
-                SettingsGroup("Live transcription") {
-                    SwitchRow("Transcribe while I speak", state.liveOn, { on(SettingsEvent.SetLive(it)) },
-                        subtitle = "ElevenLabs Realtime: text is ready when you stop. Falls back to the service above")
-                    GroupDivider()
+            if (state.engine == EngineChoice.LIVE) item {
+                SettingsGroup("ElevenLabs") {
                     SettingsRow("ElevenLabs API key",
                         subtitle = state.elevenKeyHint?.let { "$it · stored encrypted" } ?: "Needed for live transcription",
-                        subtitleColor = if (state.liveOn && state.elevenKeyHint == null) MaterialTheme.colorScheme.error
+                        subtitleColor = if (state.elevenKeyHint == null) MaterialTheme.colorScheme.error
                             else MaterialTheme.colorScheme.onSurfaceVariant,
                         onClick = { dialog = Dialog.ELEVEN_KEY })
                     if (state.elevenKeyHint != null) {
@@ -163,8 +147,35 @@ fun SettingsScreen(
                 }
             }
 
+            if (state.showCloud) item {
+                val title = when (state.engine) {
+                    EngineChoice.UPLOAD -> "Upload endpoint"
+                    EngineChoice.LIVE -> "Backup endpoint (used if live fails)"
+                    EngineChoice.ON_DEVICE -> "Cleanup endpoint"
+                }
+                SettingsGroup(title) {
+                    SettingsRow("Service", subtitle = "${state.serviceName} · ${state.baseUrl}", onClick = { dialog = Dialog.SERVICE })
+                    GroupDivider()
+                    SettingsRow("API key",
+                        subtitle = state.apiKeyHint?.let { "$it · stored encrypted" } ?: "Not set",
+                        onClick = { dialog = Dialog.API_KEY })
+                    if (state.usesCloud) {
+                        GroupDivider()
+                        SettingsRow("Transcription model", subtitle = state.sttModel,
+                            onClick = { on(SettingsEvent.OpenPicker(PickerTarget.TRANSCRIPTION)) }) {
+                            Icon(Icons.Default.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                        GroupDivider()
+                        SwitchRow("Compress uploads", state.compressAudio, { on(SettingsEvent.SetCompress(it)) },
+                            subtitle = "Opus, about 10× smaller than WAV. Falls back to WAV if refused")
+                    }
+                    GroupDivider()
+                    ConnectionRow(state, on)
+                }
+            }
+
             if (state.showLocal) item {
-                SettingsGroup(if (state.mode == TranscriptionMode.LOCAL_ONLY) "On-device model" else "Offline model") {
+                SettingsGroup(if (state.engine == EngineChoice.ON_DEVICE) "On-device model" else "Offline model") {
                     state.localModels.forEachIndexed { i, m ->
                         if (i > 0) GroupDivider()
                         LocalModelRow(m, on)
@@ -197,6 +208,13 @@ fun SettingsScreen(
                             Icon(Icons.Default.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
+                }
+            }
+
+            item {
+                SettingsGroup("Bubble") {
+                    SwitchRow("Show only when typing", state.showOnlyWhenTyping, { on(SettingsEvent.SetOnlyWhenTyping(it)) },
+                        subtitle = "Hidden unless a text field is in use")
                 }
             }
 
@@ -239,8 +257,8 @@ fun SettingsScreen(
     state.picker?.let { ModelPickerSheet(it, on) }
 
     when (dialog) {
-        Dialog.MODE -> ChoiceDialog("Transcription mode", TranscriptionMode.entries, state.mode,
-            label = { it.label }, detail = { it.description }, onDismiss = { dialog = null }) { on(SettingsEvent.SetMode(it)) }
+        Dialog.ENGINE -> ChoiceDialog("Engine", EngineChoice.entries, state.engine,
+            label = { it.title }, detail = { it.detail }, onDismiss = { dialog = null }) { on(SettingsEvent.SetEngine(it)) }
         Dialog.LANGUAGE -> LanguageDialog(state.language, onDismiss = { dialog = null }) { on(SettingsEvent.SetLanguage(it)) }
         Dialog.SERVICE -> ServiceDialog(state, onDismiss = { dialog = null }, onCustom = { dialog = Dialog.CUSTOM_URL }) {
             on(SettingsEvent.ChooseService(it))

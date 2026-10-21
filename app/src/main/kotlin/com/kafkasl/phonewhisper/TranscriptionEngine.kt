@@ -50,7 +50,7 @@ class TranscriptionEngine(private val ctx: Context) {
         val key = (liveKeyForTest ?: settings.elevenLabsKey).ifBlank { return null }
         if (!Connectivity.isOnline(ctx)) return null
         return try {
-            RealtimeSession.open(key, settings.language, RealtimeSession.keyterms(settings.vocabulary))
+            RealtimeSession.open(key, settings.language, RealtimeSession.keyterms(settings.vocabulary), settings.removeFillers)
         } catch (e: Exception) {
             Diagnostics.warn(TAG, "Could not open live session", e)
             null
@@ -201,7 +201,7 @@ class TranscriptionEngine(private val ctx: Context) {
     /** [raw] is the model's output; dictionary corrections are applied before and after cleanup. */
     private fun cleanup(raw: String, source: Source, job: Job, finish: (Outcome) -> Unit) {
         val vocab = settings.vocabulary
-        val text = Vocabulary.apply(raw, vocab)
+        val text = Vocabulary.apply(if (settings.removeFillers) Fillers.remove(raw, settings.language) else raw, vocab)
         if (!settings.usePostProcessing) return finish(Outcome.Success(text, raw, source, null))
 
         // Cleanup needs the network; skip it rather than fail when offline.

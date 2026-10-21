@@ -99,7 +99,7 @@ class RealtimeSessionTest {
 
     @Test fun `streams chunks, commits on finish and returns the final text`() {
         val partials = CopyOnWriteArrayList<String>()
-        val s = RealtimeSession.open("xi-key", "is", listOf("AIHub", "Þórunn"), onPartial = { partials += it })
+        val s = RealtimeSession.open("xi-key", "is", listOf("AIHub", "Þórunn"), noVerbatim = true, onPartial = { partials += it })
         val second = ByteArray(32000) // 1 s of audio, pushed like the recorder does
         repeat(10) { s.push(second.copyOfRange(it * 3200, (it + 1) * 3200), 3200) }
         val (text, error) = finish(s)
@@ -122,6 +122,7 @@ class RealtimeSessionTest {
         assertEquals("pcm_16000", url.queryParameter("audio_format"))
         assertEquals("manual", url.queryParameter("commit_strategy"))
         assertEquals("is", url.queryParameter("language_code"))
+        assertEquals("true", url.queryParameter("no_verbatim"))
         assertEquals(listOf("AIHub", "Þórunn"), url.queryParameterValues("keyterms"))
     }
 

@@ -123,6 +123,11 @@ class AppSettings(private val ctx: Context) {
         get() = prefs.getBoolean(KEY_LIVE, true)
         set(value) { prefs.edit().putBoolean(KEY_LIVE, value).apply() }
 
+    /** Drop "uh", "uhm" etc. (ElevenLabs no_verbatim for live, a local filter for the rest). */
+    var removeFillers: Boolean
+        get() = prefs.getBoolean(KEY_FILLERS, true)
+        set(value) { prefs.edit().putBoolean(KEY_FILLERS, value).apply() }
+
     /** Upload Opus instead of WAV. */
     var compressAudio: Boolean
         get() = prefs.getBoolean(KEY_COMPRESS, true)
@@ -170,6 +175,7 @@ class AppSettings(private val ctx: Context) {
         private const val KEY_ONLY_WHEN_TYPING = "show_only_when_typing"
         private const val KEY_ELEVEN_ENC = "elevenlabs_key_enc"
         private const val KEY_LIVE = "live_transcription"
+        private const val KEY_FILLERS = "remove_fillers"
         private const val KEY_COMPRESS = "compress_audio"
         private const val KEY_COMPRESS_REJECTED = "compress_rejected"
         private const val KEY_VOCAB = "vocabulary"

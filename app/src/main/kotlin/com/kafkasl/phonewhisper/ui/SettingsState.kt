@@ -14,6 +14,13 @@ data class LocalModelUi(
     val error: String? = null,
 )
 
+/** How dictation is transcribed. Maps onto TranscriptionMode + the live switch. */
+enum class EngineChoice(val title: String, val detail: String) {
+    LIVE("Live", "ElevenLabs Realtime. Text is ready the moment you stop"),
+    UPLOAD("Upload", "Sends the recording when you stop. OpenAI, Groq, LiteLLM or your own server"),
+    ON_DEVICE("On device", "Private and works offline. Slower, English-only models except Whisper Turbo"),
+}
+
 enum class PickerTarget(val title: String) { TRANSCRIPTION("Transcription model"), CLEANUP("Cleanup model") }
 
 data class PickerUi(
@@ -69,11 +76,15 @@ data class SettingsUiState(
     val liveTestOk: Boolean? = null,
     val liveTesting: Boolean = false,
     val compressAudio: Boolean = true,
+    val engine: EngineChoice = EngineChoice.UPLOAD,
+    val offlineFallback: Boolean = true,
+    val removeFillers: Boolean = true,
 ) {
     val ready get() = micGranted && accessibilityOn && engineReady
     val usesCloud get() = mode != TranscriptionMode.LOCAL_ONLY
+    /** The upload endpoint matters for Upload, as Live's backup, and for cleanup. */
     val showCloud get() = usesCloud || cleanupOn
-    val showLocal get() = mode != TranscriptionMode.CLOUD_ONLY
+    val showLocal get() = engine == EngineChoice.ON_DEVICE || offlineFallback
 }
 
 sealed interface SettingsEvent {
@@ -107,4 +118,7 @@ sealed interface SettingsEvent {
     data class SetElevenKey(val key: String) : SettingsEvent
     data object TestLive : SettingsEvent
     data class SetCompress(val on: Boolean) : SettingsEvent
+    data class SetEngine(val engine: EngineChoice) : SettingsEvent
+    data class SetOfflineFallback(val on: Boolean) : SettingsEvent
+    data class SetRemoveFillers(val on: Boolean) : SettingsEvent
 }

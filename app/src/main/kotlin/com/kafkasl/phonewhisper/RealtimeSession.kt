@@ -161,20 +161,22 @@ class RealtimeSession private constructor(
             .filter { it.isNotEmpty() && it.length < 50 && it.split(Regex("\\s+")).size <= 5 && '[' !in it && ']' !in it }
             .distinct().take(MAX_KEYTERMS)
 
-        fun url(base: String = DEFAULT_BASE, language: String, keyterms: List<String>): HttpUrl =
+        fun url(base: String = DEFAULT_BASE, language: String, keyterms: List<String>, noVerbatim: Boolean = false): HttpUrl =
             base.toHttpUrl().newBuilder()
                 .addQueryParameter("model_id", "scribe_v2_realtime")
                 .addQueryParameter("audio_format", "pcm_16000")
                 .addQueryParameter("commit_strategy", "manual")
                 .apply { if (language.isNotBlank()) addQueryParameter("language_code", language) }
+                // ElevenLabs' non-verbatim transcript: no "um"/"uh", false starts cleaned up.
+                .apply { if (noVerbatim) addQueryParameter("no_verbatim", "true") }
                 .apply { keyterms.forEach { addQueryParameter("keyterms", it) } }
                 .build()
 
         /** Opens a session; audio can be pushed right away. */
-        fun open(apiKey: String, language: String, keyterms: List<String>, base: String = DEFAULT_BASE,
-                 onPartial: (String) -> Unit = {}): RealtimeSession {
+        fun open(apiKey: String, language: String, keyterms: List<String>, noVerbatim: Boolean = false,
+                 base: String = DEFAULT_BASE, onPartial: (String) -> Unit = {}): RealtimeSession {
             val session = RealtimeSession(onPartial)
-            val request = Request.Builder().url(url(base, language, keyterms)).header("xi-api-key", apiKey.trim()).build()
+            val request = Request.Builder().url(url(base, language, keyterms, noVerbatim)).header("xi-api-key", apiKey.trim()).build()
             session.ws = client.newWebSocket(request, session.listener)
             return session
         }

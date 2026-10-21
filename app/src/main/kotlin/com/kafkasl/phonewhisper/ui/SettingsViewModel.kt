@@ -56,11 +56,18 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
         if (settings.modelName !in installed) MODEL_CATALOG.firstOrNull { it.archive in installed }?.let { settings.modelName = it.archive }
 
         val plan = TranscriptionRouter.plan(mode, online = true, hasApiKey = apiKey.isNotBlank(), hasLocalModel = hasModel, baseUrl = settings.baseUrl)
-        val engineReady = plan !is TranscriptionRouter.Plan.Unavailable
+        val uploadReady = plan !is TranscriptionRouter.Plan.Unavailable
+        val live = mode != TranscriptionMode.LOCAL_ONLY && settings.liveTranscription
+        val liveKey = settings.elevenLabsKey.isNotBlank()
+        val upload = "${serviceName(settings.baseUrl)} · ${settings.sttModel}"
+        val engineReady = uploadReady || (live && liveKey)
         val engineDetail = when {
+            live && liveKey -> "Live · ElevenLabs Realtime" + if (uploadReady) "" else " (no backup endpoint)"
+            live && uploadReady -> "No ElevenLabs key yet, uploading to $upload"
+            live -> "Add your ElevenLabs key"
             plan is TranscriptionRouter.Plan.Unavailable -> plan.reason
-            mode == TranscriptionMode.LOCAL_ONLY -> "On-device: ${MODEL_CATALOG.firstOrNull { it.archive == settings.modelName }?.name ?: settings.modelName}"
-            else -> "${serviceName(settings.baseUrl)} · ${settings.sttModel}"
+            mode == TranscriptionMode.LOCAL_ONLY -> "On device: ${MODEL_CATALOG.firstOrNull { it.archive == settings.modelName }?.name ?: settings.modelName}"
+            else -> "Upload · $upload"
         }
         val current = settings.postProcessingPrompt
         val prompt = when (current) {
@@ -103,6 +110,13 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
             liveTestOk = liveTest?.second,
             liveTesting = liveTesting,
             compressAudio = settings.compressAudio,
+            engine = when {
+                mode == TranscriptionMode.LOCAL_ONLY -> EngineChoice.ON_DEVICE
+                settings.liveTranscription -> EngineChoice.LIVE
+                else -> EngineChoice.UPLOAD
+            },
+            offlineFallback = mode == TranscriptionMode.CLOUD_WITH_FALLBACK,
+            removeFillers = settings.removeFillers,
             vocabCount = settings.vocabulary.size,
             vocabHints = settings.sendVocabularyHints && !settings.hintsRejectedHere,
             version = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "" } catch (_: Exception) { "" },
@@ -127,6 +141,23 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
             is SettingsEvent.SetApiKey -> { settings.apiKey = e.key; if (e.key.isNotBlank()) testConnection() else connection = null }
             SettingsEvent.TestConnection -> testConnection()
             is SettingsEvent.SetLive -> settings.liveTranscription = e.on
+            is SettingsEvent.SetEngine -> {
+                val fallback = settings.mode == TranscriptionMode.CLOUD_WITH_FALLBACK || settings.mode == TranscriptionMode.LOCAL_ONLY
+                when (e.engine) {
+                    EngineChoice.ON_DEVICE -> settings.mode = TranscriptionMode.LOCAL_ONLY
+                    EngineChoice.LIVE, EngineChoice.UPLOAD -> {
+                        settings.liveTranscription = e.engine == EngineChoice.LIVE
+                        settings.mode = if (fallback) TranscriptionMode.CLOUD_WITH_FALLBACK else TranscriptionMode.CLOUD_ONLY
+                    }
+                }
+                WhisperAccessibilityService.instance?.reloadModel()
+            }
+            is SettingsEvent.SetOfflineFallback -> {
+                if (settings.mode != TranscriptionMode.LOCAL_ONLY) {
+                    settings.mode = if (e.on) TranscriptionMode.CLOUD_WITH_FALLBACK else TranscriptionMode.CLOUD_ONLY
+                }
+            }
+            is SettingsEvent.SetRemoveFillers -> settings.removeFillers = e.on
             is SettingsEvent.SetElevenKey -> {
                 settings.elevenLabsKey = e.key
                 liveTest = null

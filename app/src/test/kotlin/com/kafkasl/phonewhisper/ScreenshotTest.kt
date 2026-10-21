@@ -47,7 +47,7 @@ class ScreenshotTest {
 
     private val ready = SettingsUiState(
         micGranted = true, accessibilityOn = true, engineReady = true,
-        engineDetail = "Custom · eleven-scribe",
+        engineDetail = "Live · ElevenLabs Realtime",
         mode = TranscriptionMode.CLOUD_WITH_FALLBACK, language = "is",
         serviceName = "Custom", baseUrl = "https://litellm.example.com/v1", apiKeyHint = "••••x9Qa",
         sttModel = "eleven-scribe",
@@ -63,6 +63,7 @@ class ScreenshotTest {
         cleanupOn = true, prompt = PromptPreset.DEV, chatModel = "claude-haiku",
         historyOn = true, retentionDays = 7, version = "0.3.0",
         elevenKeyHint = "••••7f2c", liveTest = "Live transcription works", liveTestOk = true, vocabCount = 5,
+        engine = com.kafkasl.phonewhisper.ui.EngineChoice.LIVE, offlineFallback = true,
     )
 
     @Test @Config(qualifiers = "w400dp-h2900dp-xxhdpi")
