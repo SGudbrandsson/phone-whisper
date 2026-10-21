@@ -30,6 +30,13 @@ object TranscriberClient {
          * True when the server (or a proxy such as LiteLLM) refused an optional parameter, as
          * LiteLLM does with "UnsupportedParamsError" for providers that lack it.
          */
+        /** The server couldn't read the uploaded file's format (worth retrying as WAV). */
+        val looksLikeFormatRejection: Boolean get() {
+            if (httpCode != 400 && httpCode != 415 && httpCode != 422) return false
+            val e = error?.lowercase() ?: return false
+            return listOf("format", "decode", "codec", "ogg", "opus", "invalid file", "corrupt", "could not process").any { it in e }
+        }
+
         val looksLikeParamRejection: Boolean get() {
             if (httpCode != 400 && httpCode != 422) return false
             val e = error?.lowercase() ?: return false
@@ -83,13 +90,15 @@ object TranscriberClient {
         } catch (_: IllegalArgumentException) {} // malformed URL: the real request will report it
     }
 
-    fun buildRequest(wavData: ByteArray, config: Config): Request {
+    fun buildRequest(wavData: ByteArray, config: Config): Request = buildRequest(EncodedAudio(wavData, "audio.wav", "audio/wav"), config)
+
+    fun buildRequest(audio: EncodedAudio, config: Config): Request {
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart("model", config.model)
             .apply { if (config.language.isNotBlank()) addFormDataPart("language", config.language) }
             .apply { if (!config.prompt.isNullOrBlank()) addFormDataPart("prompt", config.prompt) }
-            .addFormDataPart("file", "audio.wav", wavData.toRequestBody("audio/wav".toMediaType()))
+            .addFormDataPart("file", audio.fileName, audio.bytes.toRequestBody(audio.mimeType.toMediaType()))
             .build()
 
         return Request.Builder()
@@ -108,8 +117,15 @@ object TranscriberClient {
         config: Config,
         onCall: (Call) -> Unit = {},
         callback: (Result) -> Unit,
+    ): Call = transcribe(EncodedAudio(wavData, "audio.wav", "audio/wav"), config, onCall, callback)
+
+    fun transcribe(
+        audio: EncodedAudio,
+        config: Config,
+        onCall: (Call) -> Unit = {},
+        callback: (Result) -> Unit,
     ): Call {
-        val call = client.newCall(buildRequest(wavData, config))
+        val call = client.newCall(buildRequest(audio, config))
         onCall(call)
         call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {

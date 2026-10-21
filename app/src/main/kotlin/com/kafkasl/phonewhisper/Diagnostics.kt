@@ -183,6 +183,9 @@ object Diagnostics {
             "STT model: ${s.sttModel}\n" +
             "Language: ${s.language.ifBlank { "auto" }}\n" +
             "Cleanup: ${if (s.usePostProcessing) "on (${s.chatModel})" else "off"}\n" +
+            "Live transcription: ${if (!s.liveTranscription) "off" else if (s.elevenLabsKey.isBlank()) "on, no ElevenLabs key" else "on"}\n" +
+            "Compressed uploads: ${s.compressAudio}${if (s.compressionRejectedHere) " (rejected by this server, using WAV)" else ""}\n" +
+            "Dictionary: ${s.vocabulary.size} words${if (s.hintsRejectedHere) " (hints refused by this server)" else ""}\n" +
             "Local models: ${LocalTranscriber.availableModels(ctx).joinToString().ifBlank { "none" }}\n" +
             "Accessibility service running: ${WhisperAccessibilityService.instance != null}"
     } catch (e: Exception) {

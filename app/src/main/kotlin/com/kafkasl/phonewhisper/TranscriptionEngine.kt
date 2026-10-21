@@ -11,7 +11,9 @@ import kotlin.concurrent.thread
  */
 class TranscriptionEngine(private val ctx: Context) {
 
-    enum class Source(val label: String) { CLOUD("Cloud"), LOCAL("Local"), LOCAL_FALLBACK("Local (offline)") }
+    enum class Source(val label: String) {
+        CLOUD("Cloud"), CLOUD_LIVE("Cloud (live)"), LOCAL("Local"), LOCAL_FALLBACK("Local (offline)")
+    }
 
     sealed class Outcome {
         /** [rawText] is the transcript before cleanup; equal to [text] when cleanup didn't run. */
@@ -24,7 +26,8 @@ class TranscriptionEngine(private val ctx: Context) {
         @Volatile var cancelled = false
             private set
         @Volatile internal var call: okhttp3.Call? = null
-        fun cancel() { cancelled = true; call?.cancel() }
+        @Volatile internal var live: RealtimeSession? = null
+        fun cancel() { cancelled = true; call?.cancel(); live?.cancel() }
     }
 
     private val settings = AppSettings(ctx)
@@ -37,7 +40,30 @@ class TranscriptionEngine(private val ctx: Context) {
      * Transcribes [pcm] (16 kHz mono 16-bit). [onStatus] reports progress such as a fallback;
      * [done] is called exactly once, on a background thread, unless the job is cancelled.
      */
-    fun run(pcm: ByteArray, onStatus: (String) -> Unit = {}, done: (Outcome) -> Unit): Job {
+    /**
+     * Opens a live ElevenLabs session for a dictation that is starting, or null when live
+     * transcription is off, has no key, or there's no network. Feed it with [RealtimeSession.push]
+     * and pass it to [run].
+     */
+    fun startLive(): RealtimeSession? {
+        if (!settings.liveTranscription || settings.mode == TranscriptionMode.LOCAL_ONLY) return null
+        val key = (liveKeyForTest ?: settings.elevenLabsKey).ifBlank { return null }
+        if (!Connectivity.isOnline(ctx)) return null
+        return try {
+            RealtimeSession.open(key, settings.language, RealtimeSession.keyterms(settings.vocabulary))
+        } catch (e: Exception) {
+            Diagnostics.warn(TAG, "Could not open live session", e)
+            null
+        }
+    }
+
+    /** Robolectric has no Keystore, so tests supply the key here. */
+    @androidx.annotation.VisibleForTesting internal var liveKeyForTest: String? = null
+
+    /** Converts PCM for upload. Swappable in tests. */
+    internal var encoder: (ByteArray) -> EncodedAudio? = { pcm -> AudioEncoder.opusOgg(ctx, pcm) }
+
+    fun run(pcm: ByteArray, live: RealtimeSession? = null, onStatus: (String) -> Unit = {}, done: (Outcome) -> Unit): Job {
         val job = Job()
         val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
         val finish: (Outcome) -> Unit = { outcome ->
@@ -51,6 +77,30 @@ class TranscriptionEngine(private val ctx: Context) {
             }
         }
 
+        if (live != null) {
+            // The live session already has the audio: only the final commit is left.
+            job.live = live
+            val t0 = System.currentTimeMillis()
+            live.finish { text, error ->
+                job.live = null
+                if (job.cancelled) return@finish
+                if (text != null) {
+                    Diagnostics.info(TAG, "Live transcript ${System.currentTimeMillis() - t0} ms after stop " +
+                        "(${pcm.size / 2 / SAMPLE_RATE.toFloat()} s audio)")
+                    cleanup(text, Source.CLOUD_LIVE, job, finish)
+                } else {
+                    Diagnostics.warn(TAG, "Live transcription failed ($error); uploading the recording instead")
+                    onStatus("Uploading…")
+                    plan(pcm, job, onStatus, finish)
+                }
+            }
+            return job
+        }
+        plan(pcm, job, onStatus, finish)
+        return job
+    }
+
+    private fun plan(pcm: ByteArray, job: Job, onStatus: (String) -> Unit, finish: (Outcome) -> Unit) {
         // Planning touches the Keystore and disk, so keep it off the caller's (main) thread.
         thread {
             try {
@@ -73,34 +123,41 @@ class TranscriptionEngine(private val ctx: Context) {
                 finish(Outcome.Failure(e.message ?: "Transcription failed"))
             }
         }
-        return job
     }
 
     private fun runCloud(
         pcm: ByteArray, fallbackToLocal: Boolean, job: Job,
         onStatus: (String) -> Unit, finish: (Outcome) -> Unit,
     ) {
-        val wav = WavWriter.encode(pcm)
-        sendCloud(pcm, wav, settings.cloudConfig(), fallbackToLocal, job, onStatus, finish)
+        val e0 = System.currentTimeMillis()
+        val audio = (if (settings.compressAudio && !settings.compressionRejectedHere) encoder(pcm) else null)
+            ?: EncodedAudio.wav(pcm)
+        if (audio.fileName != "audio.wav") Log.i(TAG, "Encoded ${audio.bytes.size / 1024} KB in ${System.currentTimeMillis() - e0} ms")
+        sendCloud(pcm, audio, settings.cloudConfig(), fallbackToLocal, job, onStatus, finish)
     }
 
     private fun sendCloud(
-        pcm: ByteArray, wav: ByteArray, config: TranscriberClient.Config, fallbackToLocal: Boolean, job: Job,
+        pcm: ByteArray, audio: EncodedAudio, config: TranscriberClient.Config, fallbackToLocal: Boolean, job: Job,
         onStatus: (String) -> Unit, finish: (Outcome) -> Unit,
     ) {
         val t0 = System.currentTimeMillis()
-        TranscriberClient.transcribe(wav, config, onCall = { job.call = it; if (job.cancelled) it.cancel() }) { result ->
+        TranscriberClient.transcribe(audio, config, onCall = { job.call = it; if (job.cancelled) it.cancel() }) { result ->
             job.call = null
             // Upload + server time, to see where dictation latency goes (diagnostics report).
             Diagnostics.info(TAG, "Cloud request: ${System.currentTimeMillis() - t0} ms for " +
-                "${pcm.size / 2 / SAMPLE_RATE.toFloat()} s audio (${wav.size / 1024} KB upload)")
+                "${pcm.size / 2 / SAMPLE_RATE.toFloat()} s audio (${audio.bytes.size / 1024} KB ${audio.fileName.substringAfter('.')})")
             when {
                 job.cancelled -> Unit
+                audio.fileName != "audio.wav" && result.looksLikeFormatRejection -> {
+                    Diagnostics.warn(TAG, "Server couldn't read compressed audio (${result.error}); retrying as WAV")
+                    settings.compressionRejectedHere = true
+                    sendCloud(pcm, EncodedAudio.wav(pcm), config, fallbackToLocal, job, onStatus, finish)
+                }
                 config.prompt != null && result.looksLikeParamRejection -> {
                     // Don't let the dictionary break dictation: drop the hints here from now on.
                     Diagnostics.warn(TAG, "Server refused dictionary hints (${result.error}); retrying without them")
                     settings.hintsRejectedHere = true
-                    sendCloud(pcm, wav, config.copy(prompt = null), fallbackToLocal, job, onStatus, finish)
+                    sendCloud(pcm, audio, config.copy(prompt = null), fallbackToLocal, job, onStatus, finish)
                 }
                 !result.text.isNullOrBlank() -> cleanup(result.text.trim(), Source.CLOUD, job, finish)
                 result.networkFailure && fallbackToLocal -> {

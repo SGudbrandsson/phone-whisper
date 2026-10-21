@@ -39,6 +39,8 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     private val downloads = mutableMapOf<String, Pair<Float?, String?>>()
     private var connection: Pair<String, Boolean>? = null
     private var testing = false
+    private var liveTest: Pair<String, Boolean>? = null
+    private var liveTesting = false
 
     init { refresh() }
 
@@ -95,6 +97,12 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
             historyOn = settings.historyEnabled,
             retentionDays = settings.retentionDays,
             picker = _state.value.picker,
+            liveOn = settings.liveTranscription,
+            elevenKeyHint = settings.elevenLabsKey.takeIf { it.isNotBlank() }?.let { "••••${it.takeLast(4)}" },
+            liveTest = liveTest?.first,
+            liveTestOk = liveTest?.second,
+            liveTesting = liveTesting,
+            compressAudio = settings.compressAudio,
             vocabCount = settings.vocabulary.size,
             vocabHints = settings.sendVocabularyHints && !settings.hintsRejectedHere,
             version = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "" } catch (_: Exception) { "" },
@@ -118,6 +126,17 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
             is SettingsEvent.SetCustomUrl -> { settings.baseUrl = Endpoints.normalizeBase(e.url); testConnection() }
             is SettingsEvent.SetApiKey -> { settings.apiKey = e.key; if (e.key.isNotBlank()) testConnection() else connection = null }
             SettingsEvent.TestConnection -> testConnection()
+            is SettingsEvent.SetLive -> settings.liveTranscription = e.on
+            is SettingsEvent.SetElevenKey -> {
+                settings.elevenLabsKey = e.key
+                liveTest = null
+                if (e.key.isNotBlank()) testLive()
+            }
+            SettingsEvent.TestLive -> testLive()
+            is SettingsEvent.SetCompress -> {
+                settings.compressAudio = e.on
+                if (e.on) settings.compressionRejectedHere = false // let it try again
+            }
             is SettingsEvent.OpenPicker -> openPicker(e.target)
             SettingsEvent.RefreshPicker -> _state.value.picker?.let { loadPicker(it.target) }
             SettingsEvent.ClosePicker -> _state.update { it.copy(picker = null) }
@@ -152,6 +171,21 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun customPromptOrDefault() = settings.prefs.getString(KEY_CUSTOM_PROMPT, null) ?: PostProcessor.DEFAULT_PROMPT
+
+    private fun testLive() {
+        val key = settings.elevenLabsKey
+        if (key.isBlank()) return
+        liveTesting = true
+        refresh()
+        com.kafkasl.phonewhisper.RealtimeSession.test(key) { ok, msg ->
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                liveTesting = false
+                liveTest = msg to ok
+                if (!ok) Diagnostics.warn("Settings", "Live transcription test failed: $msg")
+                refresh()
+            }
+        }
+    }
 
     private fun testConnection() {
         testing = true

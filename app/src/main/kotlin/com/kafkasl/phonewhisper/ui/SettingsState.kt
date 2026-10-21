@@ -62,6 +62,13 @@ data class SettingsUiState(
     val version: String = "",
     val vocabCount: Int = 0,
     val vocabHints: Boolean = true,
+    val liveOn: Boolean = true,
+    /** "••••abcd" or null when no ElevenLabs key is stored. */
+    val elevenKeyHint: String? = null,
+    val liveTest: String? = null,
+    val liveTestOk: Boolean? = null,
+    val liveTesting: Boolean = false,
+    val compressAudio: Boolean = true,
 ) {
     val ready get() = micGranted && accessibilityOn && engineReady
     val usesCloud get() = mode != TranscriptionMode.LOCAL_ONLY
@@ -96,4 +103,8 @@ sealed interface SettingsEvent {
     data object OpenHistory : SettingsEvent
     data object OpenDiagnostics : SettingsEvent
     data object OpenDictionary : SettingsEvent
+    data class SetLive(val on: Boolean) : SettingsEvent
+    data class SetElevenKey(val key: String) : SettingsEvent
+    data object TestLive : SettingsEvent
+    data class SetCompress(val on: Boolean) : SettingsEvent
 }

@@ -56,7 +56,7 @@ import com.kafkasl.phonewhisper.HistoryPolicy
 import com.kafkasl.phonewhisper.R
 import com.kafkasl.phonewhisper.TranscriptionMode
 
-private enum class Dialog { MODE, LANGUAGE, SERVICE, CUSTOM_URL, API_KEY, PROMPT, RETENTION, CLEAR_HISTORY }
+private enum class Dialog { MODE, LANGUAGE, SERVICE, CUSTOM_URL, API_KEY, ELEVEN_KEY, PROMPT, RETENTION, CLEAR_HISTORY }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -124,7 +124,42 @@ fun SettingsScreen(
                         }
                     }
                     GroupDivider()
+                    SwitchRow("Compress uploads", state.compressAudio, { on(SettingsEvent.SetCompress(it)) },
+                        subtitle = "Opus audio, about 10× smaller than WAV. Falls back to WAV if the server can't read it")
+                    GroupDivider()
                     ConnectionRow(state, on)
+                }
+            }
+
+            if (state.usesCloud) item {
+                SettingsGroup("Live transcription") {
+                    SwitchRow("Transcribe while I speak", state.liveOn, { on(SettingsEvent.SetLive(it)) },
+                        subtitle = "ElevenLabs Realtime: text is ready when you stop. Falls back to the service above")
+                    GroupDivider()
+                    SettingsRow("ElevenLabs API key",
+                        subtitle = state.elevenKeyHint?.let { "$it · stored encrypted" } ?: "Needed for live transcription",
+                        subtitleColor = if (state.liveOn && state.elevenKeyHint == null) MaterialTheme.colorScheme.error
+                            else MaterialTheme.colorScheme.onSurfaceVariant,
+                        onClick = { dialog = Dialog.ELEVEN_KEY })
+                    if (state.elevenKeyHint != null) {
+                        GroupDivider()
+                        SettingsRow(
+                            "Test live connection",
+                            subtitle = when {
+                                state.liveTesting -> "Connecting…"
+                                state.liveTest != null -> state.liveTest
+                                else -> "Opens a session with ElevenLabs and closes it"
+                            },
+                            subtitleColor = when (state.liveTestOk) {
+                                true -> MaterialTheme.colorScheme.primary
+                                false -> MaterialTheme.colorScheme.error
+                                null -> MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            onClick = { on(SettingsEvent.TestLive) },
+                        ) {
+                            if (state.liveTesting) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        }
+                    }
                 }
             }
 
@@ -217,6 +252,10 @@ fun SettingsScreen(
             note = "Leave blank if your server needs none. Stored encrypted.", password = true,
             extra = if (state.apiKeyHint != null) ("Remove" to { on(SettingsEvent.SetApiKey("")) }) else null,
             onDismiss = { dialog = null }) { on(SettingsEvent.SetApiKey(it)) }
+        Dialog.ELEVEN_KEY -> TextDialog("ElevenLabs API key", "", "Paste ElevenLabs key",
+            note = "Used only for live transcription, sent straight to ElevenLabs. Stored encrypted.", password = true,
+            extra = if (state.elevenKeyHint != null) ("Remove" to { on(SettingsEvent.SetElevenKey("")) }) else null,
+            onDismiss = { dialog = null }) { on(SettingsEvent.SetElevenKey(it)) }
         Dialog.PROMPT -> TextDialog("Custom cleanup prompt", state.customPrompt, "Prompt", singleLine = false,
             onDismiss = { dialog = null }) { on(SettingsEvent.SetCustomPrompt(it)) }
         Dialog.RETENTION -> ChoiceDialog("Auto-clear history", HistoryPolicy.RETENTION_CHOICES, state.retentionDays,

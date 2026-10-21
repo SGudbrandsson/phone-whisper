@@ -113,6 +113,33 @@ class AppSettings(private val ctx: Context) {
             prefs.edit().putStringSet(KEY_HINTS_REJECTED, set).apply()
         }
 
+    /** ElevenLabs key for live transcription; stored encrypted like [apiKey]. */
+    var elevenLabsKey: String
+        get() = secrets.get(KEY_ELEVEN_ENC) ?: ""
+        set(value) { if (value.isBlank()) secrets.remove(KEY_ELEVEN_ENC) else secrets.put(KEY_ELEVEN_ENC, value.trim()) }
+
+    /** Stream audio to ElevenLabs Realtime while recording (needs [elevenLabsKey]). */
+    var liveTranscription: Boolean
+        get() = prefs.getBoolean(KEY_LIVE, true)
+        set(value) { prefs.edit().putBoolean(KEY_LIVE, value).apply() }
+
+    /** Upload Opus instead of WAV. */
+    var compressAudio: Boolean
+        get() = prefs.getBoolean(KEY_COMPRESS, true)
+        set(value) { prefs.edit().putBoolean(KEY_COMPRESS, value).apply() }
+
+    private fun flagSet(key: String) = prefs.getStringSet(key, emptySet()) ?: emptySet()
+    private fun setFlag(key: String, on: Boolean) {
+        val set = flagSet(key).toMutableSet()
+        if (on) set += hintKey() else set -= hintKey()
+        prefs.edit().putStringSet(key, set).apply()
+    }
+
+    /** True after this endpoint+model couldn't read compressed audio; WAV is sent there. */
+    var compressionRejectedHere: Boolean
+        get() = hintKey() in flagSet(KEY_COMPRESS_REJECTED)
+        set(value) = setFlag(KEY_COMPRESS_REJECTED, value)
+
     /** Last `GET /models` result for the current endpoint; empty if none or the endpoint changed. */
     var cachedModels: List<RemoteModel>
         get() = if (prefs.getString(KEY_MODELS_BASE, null) == Endpoints.normalizeBase(baseUrl))
@@ -141,6 +168,10 @@ class AppSettings(private val ctx: Context) {
         private const val KEY_HISTORY_ENABLED = "history_enabled"
         private const val KEY_RETENTION_DAYS = "history_retention_days"
         private const val KEY_ONLY_WHEN_TYPING = "show_only_when_typing"
+        private const val KEY_ELEVEN_ENC = "elevenlabs_key_enc"
+        private const val KEY_LIVE = "live_transcription"
+        private const val KEY_COMPRESS = "compress_audio"
+        private const val KEY_COMPRESS_REJECTED = "compress_rejected"
         private const val KEY_VOCAB = "vocabulary"
         private const val KEY_VOCAB_HINTS = "vocabulary_hints"
         private const val KEY_HINTS_REJECTED = "vocabulary_hints_rejected"

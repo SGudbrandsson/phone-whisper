@@ -62,6 +62,7 @@ class ScreenshotTest {
         ),
         cleanupOn = true, prompt = PromptPreset.DEV, chatModel = "claude-haiku",
         historyOn = true, retentionDays = 7, version = "0.3.0",
+        elevenKeyHint = "••••7f2c", liveTest = "Live transcription works", liveTestOk = true, vocabCount = 5,
     )
 
     @Test @Config(qualifiers = "w400dp-h2900dp-xxhdpi")

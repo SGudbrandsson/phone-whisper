@@ -124,6 +124,8 @@ class WhisperAccessibilityService : AccessibilityService() {
     // abandoned session are dropped instead of being typed into the wrong place.
     @Volatile private var session = 0
     private var currentJob: TranscriptionEngine.Job? = null
+    /** Open while recording when live transcription is on. */
+    private var liveSession: RealtimeSession? = null
     private var targetPackage: String? = null
 
     private val dp get() = resources.displayMetrics.density
@@ -297,6 +299,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         currentJob = null
         releaseRecorder()
         pcmStream = null
+        liveSession?.cancel()
+        liveSession = null
         stopPulse() // an infinite animator would keep requesting frames after the views are gone
         removeOverlay()
         thread { engine.unloadLocalModel() }
@@ -875,6 +879,9 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
         handler.removeCallbacks(hideBubbleNow)
         if (settings.mode != TranscriptionMode.LOCAL_ONLY) TranscriberClient.warmUp(settings.baseUrl)
+        // Live transcription: audio is sent while the user speaks, so text is ready on stop.
+        val live = engine.startLive()
+        liveSession = live
         state = State.RECORDING
         recordStartMs = System.currentTimeMillis()
         setBusy(false)
@@ -889,6 +896,7 @@ class WhisperAccessibilityService : AccessibilityService() {
                 if (n < 0) break // recorder stopped/released or errored
                 if (n == 0) continue
                 stream.write(buf, 0, n)
+                live?.push(buf, n)
                 if (stream.size() >= MAX_RECORDING_BYTES) {
                     handler.post { if (state == State.RECORDING && pcmStream === stream) { showFeedback("Max length reached", 1500); stopAndTranscribe() } }
                     break
@@ -910,12 +918,14 @@ class WhisperAccessibilityService : AccessibilityService() {
         val pcm = pcmStream?.toByteArray() ?: ByteArray(0)
         pcmStream = null
 
-        if (pcm.isEmpty()) { reset("No audio captured"); return }
+        if (pcm.isEmpty()) { liveSession?.cancel(); liveSession = null; reset("No audio captured"); return }
         showPillStatus("Transcribing…")
 
         val id = session
         val target = targetPackage
-        currentJob = engine.run(pcm, onStatus = { if (id == session) showPillStatus(it) }) { outcome ->
+        val live = liveSession
+        liveSession = null
+        currentJob = engine.run(pcm, live, onStatus = { if (id == session) showPillStatus(it) }) { outcome ->
             if (id != session) return@run
             when (outcome) {
                 is TranscriptionEngine.Outcome.Success -> {
@@ -956,6 +966,8 @@ class WhisperAccessibilityService : AccessibilityService() {
     private fun cancelDictation() {
         if (state == State.IDLE) return
         session++ // late results from the cancelled session are ignored
+        liveSession?.cancel()
+        liveSession = null
         currentJob?.cancel()
         currentJob = null
         state = State.IDLE
