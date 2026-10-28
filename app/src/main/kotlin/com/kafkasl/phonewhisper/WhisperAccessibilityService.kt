@@ -13,6 +13,7 @@ import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -25,6 +26,7 @@ import android.widget.ImageView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
+import androidx.annotation.VisibleForTesting
 import java.io.ByteArrayOutputStream
 import kotlin.concurrent.thread
 import kotlin.math.abs
@@ -33,6 +35,14 @@ class WhisperAccessibilityService : AccessibilityService() {
 
     companion object {
         var instance: WhisperAccessibilityService? = null
+
+        /** Accessibility events the service needs for the show-only-when-typing setting. */
+        internal fun eventTypesFor(onlyWhenTyping: Boolean, sdk: Int): Int = when {
+            !onlyWhenTyping -> 0
+            sdk >= 33 -> AccessibilityEvent.TYPE_WINDOWS_CHANGED // input-method hooks do the rest
+            else -> AccessibilityEvent.TYPE_WINDOWS_CHANGED or AccessibilityEvent.TYPE_VIEW_FOCUSED or
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        }
         private const val TAG = "PhoneWhisper"
         private const val SAMPLE_RATE = 16000
         private const val BTN_DP = 44
@@ -47,17 +57,55 @@ class WhisperAccessibilityService : AccessibilityService() {
         private const val COLOR_BUSY = 0xDD6B6B6B.toInt()
         private const val COLOR_FEEDBACK_BG = 0xEE1C1C1E.toInt()
         private const val COLOR_RING = 0xFFE8EAED.toInt()
+        private const val COLOR_PILL_BG = 0xEE1C1C1E.toInt()
+        private const val COLOR_CANCEL = 0xFF3A3A3C.toInt()
+        private const val COLOR_STOP = 0xFFEF4444.toInt()
+        /** Hairline around the bubble and pill so they stand out on dark screens. */
+        private const val COLOR_OUTLINE = 0x33FFFFFF
+        private const val PILL_W_DP = 216
+        private const val PILL_GAP_DP = 6
+        private const val QUICK_HISTORY_COUNT = 10
+        /** Bridges finish -> start input when moving between fields. */
+        private const val HIDE_DELAY_MS = 60L
+        private const val FADE_IN_MS = 120L
+        private const val FADE_OUT_MS = 150L
+        /** 10 minutes of 16 kHz 16-bit mono; keeps uploads under the common 25 MB API limit. */
+        private const val MAX_RECORDING_BYTES = 10 * 60 * 16000 * 2
     }
 
-    private enum class State { IDLE, RECORDING, TRANSCRIBING }
+    @VisibleForTesting internal enum class State { IDLE, RECORDING, TRANSCRIBING }
 
-    private var state = State.IDLE
-    private var overlayView: FrameLayout? = null
+    @VisibleForTesting @Volatile internal var state = State.IDLE
+        private set
+    @VisibleForTesting internal var overlayView: FrameLayout? = null
+        private set
     private var button: ImageView? = null
     private var spinner: ProgressBar? = null
-    private var feedbackView: TextView? = null
+    @VisibleForTesting internal var feedbackView: TextView? = null
+        private set
     private var layoutParams: WindowManager.LayoutParams? = null
     private var feedbackLayoutParams: WindowManager.LayoutParams? = null
+
+    // Recording pill: [✕] waveform/status timer [✓], shown beside the bubble while busy.
+    @VisibleForTesting internal var pillView: android.widget.LinearLayout? = null
+        private set
+    private var pillParams: WindowManager.LayoutParams? = null
+    private var pillShown = false
+    private var waveform: WaveformView? = null
+    @VisibleForTesting internal val waveformForTest get() = waveform
+    private var pillStatus: TextView? = null
+    private var pillTimer: TextView? = null
+    private var pillStop: View? = null
+    private var pillBusy: View? = null
+    private var recordStartMs = 0L
+    private val tickTimer = object : Runnable {
+        override fun run() {
+            if (state != State.RECORDING) return
+            val secs = (System.currentTimeMillis() - recordStartMs) / 1000
+            pillTimer?.text = String.format(java.util.Locale.US, "%d:%02d", secs / 60, secs % 60)
+            handler.postDelayed(this, 500)
+        }
+    }
     private var audioRecord: AudioRecord? = null
     private var pcmStream: ByteArrayOutputStream? = null
     private val handler = Handler(Looper.getMainLooper())
@@ -67,50 +115,205 @@ class WhisperAccessibilityService : AccessibilityService() {
         }?.start()
     }
 
-    // Local transcription engine (loaded lazily)
-    private var localTranscriber: LocalTranscriber? = null
+    private val settings by lazy { AppSettings(this) }
+    /** Shared so the history screen can retry with the already-loaded local model. */
+    val engine by lazy { TranscriptionEngine(this) }
+    private val history by lazy { HistoryStore.get(this) }
+
+    // Increments on every new recording and on cancel, so late results from an
+    // abandoned session are dropped instead of being typed into the wrong place.
+    @Volatile private var session = 0
+    private var currentJob: TranscriptionEngine.Job? = null
+    /** Open while recording when live transcription is on. */
+    private var liveSession: RealtimeSession? = null
+    private var targetPackage: String? = null
 
     private val dp get() = resources.displayMetrics.density
     private val screenW get() = resources.displayMetrics.widthPixels
     private val screenH get() = resources.displayMetrics.heightPixels
 
-    override fun onServiceConnected() {
+    public override fun onServiceConnected() { // public so tests can drive it
         instance = this
+        Diagnostics.info(TAG, "Accessibility service connected")
         showOverlay()
-        // Try to load local model in background
-        thread { initLocalModel() }
+        refreshVisibility()
+        // The keyboard/focus events around unlocking can arrive while still "locked"; re-check after unlock.
+        androidx.core.content.ContextCompat.registerReceiver(
+            this, unlockReceiver, android.content.IntentFilter(android.content.Intent.ACTION_USER_PRESENT),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        HistoryCleanupWorker.schedule(this)
+        thread {
+            history.prune(settings.retentionDays)
+            // In local-only mode, load the model now so the first dictation is fast.
+            // Otherwise it is loaded only when a fallback actually needs it.
+            if (settings.mode == TranscriptionMode.LOCAL_ONLY) engine.obtainLocalModel()
+        }
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    // --- Show only when typing ---
+
+    private var bubbleVisible = true
+    private val typing = TypingSignals()
+    private val unlockReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: android.content.Intent?) {
+            if (overlayView != null) { typing.imeVisible = queryImeVisible(); requestEvaluate() }
+        }
+    }
+    private var evaluatePosted = false
+    private val evaluateVisibility = Runnable { evaluatePosted = false; applyVisibility(computeTypingState()) }
+    private val hideBubbleNow = Runnable {
+        if (state == State.IDLE && sheetView == null && !computeTypingState()) setBubbleVisible(false)
+    }
+    /** Re-checks after an editor started but no keyboard showed up (one-shot, not a poll). */
+    private val keyboardTimeout = Runnable { requestEvaluate() }
+
+    /** Coalesces a burst of callbacks into one check on the next main-loop turn: no fixed delay. */
+    private fun requestEvaluate() {
+        if (evaluatePosted) return
+        evaluatePosted = true
+        handler.post(evaluateVisibility)
+    }
+
+    /**
+     * Android 13+: called by the system whenever any text field gains or loses input, before the
+     * keyboard animates in. This is what makes the bubble appear instantly.
+     */
+    @androidx.annotation.RequiresApi(33)
+    override fun onCreateInputMethod(): android.accessibilityservice.InputMethod {
+        typing.hooksActive = true
+        return object : android.accessibilityservice.InputMethod(this) {
+            override fun onStartInput(attribute: android.view.inputmethod.EditorInfo, restarting: Boolean) {
+                super.onStartInput(attribute, restarting)
+                val pkg = attribute.packageName
+                handler.post {
+                    typing.onStartInput(pkg, SystemClock.uptimeMillis())
+                    handler.removeCallbacks(keyboardTimeout)
+                    handler.postDelayed(keyboardTimeout, TypingSignals.KEYBOARD_WAIT_MS)
+                    requestEvaluate()
+                }
+            }
+
+            override fun onFinishInput() {
+                super.onFinishInput()
+                handler.post { typing.onFinishInput(); requestEvaluate() }
+            }
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        event ?: return
+        if (!onlyWhenTyping) return
+        when (event.eventType) {
+            // The keyboard window appearing or going away is the main hide signal.
+            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> typing.imeVisible = queryImeVisible()
+            // Pre-13 fallback only; on 13+ this event type isn't subscribed.
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> if (event.packageName == packageName) return
+        }
+        requestEvaluate()
+    }
+
+    private fun queryImeVisible(): Boolean = try {
+        windows.any { it.type == android.view.accessibility.AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+    } catch (_: Exception) { false }
+
+    private val usesInputMethodHooks get() = android.os.Build.VERSION.SDK_INT >= 33
+
+    /** True while the keyboard is up, or an editor just started and its keyboard is on the way. */
+    private fun computeTypingState(): Boolean {
+        if (isLocked()) return false // never offer dictation on the lock screen (PIN/password fields)
+        if (usesInputMethodHooks) return typing.isTyping(SystemClock.uptimeMillis(), packageName)
+        if (typing.imeVisible) return true
+        // Android 11-12: no input-method hooks, so look for a focused editable field.
+        val root = rootInActiveWindow ?: return false
+        return try {
+            if (root.packageName == packageName) return false // our own settings screen
+            root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)?.let { focus ->
+                (focus.isEditable || focus.className?.toString()?.contains("EditText") == true).also { focus.recycle() }
+            } ?: false
+        } finally { root.recycle() }
+    }
+
+    private fun applyVisibility(typing: Boolean) {
+        val keepVisible = !onlyWhenTyping || typing ||
+            state != State.IDLE || sheetView != null
+        if (keepVisible) {
+            handler.removeCallbacks(hideBubbleNow)
+            setBubbleVisible(true)
+        } else if (bubbleVisible) {
+            // Brief grace so moving between fields (finish -> start input) doesn't flicker.
+            handler.removeCallbacks(hideBubbleNow)
+            handler.postDelayed(hideBubbleNow, HIDE_DELAY_MS)
+        }
+    }
+
+    private fun setBubbleVisible(visible: Boolean) {
+        val view = overlayView ?: return
+        val params = layoutParams ?: return
+        if (visible == bubbleVisible) return
+        bubbleVisible = visible
+        // A hidden overlay must not swallow touches meant for the app underneath, so touch is
+        // switched off at the start of the fade, not the end.
+        params.flags = if (visible) params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+            else params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(view, params)
+        view.animate().cancel() // a show during a fade-out reverses it from the current alpha
+        if (visible) {
+            view.visibility = View.VISIBLE
+            view.animate().alpha(1f).setDuration(FADE_IN_MS).start()
+        } else {
+            view.animate().alpha(0f).setDuration(FADE_OUT_MS).withEndAction {
+                if (!bubbleVisible) view.visibility = View.GONE
+            }.start()
+        }
+    }
+
+    /** Cached so the event handler doesn't read preferences per event. */
+    private var onlyWhenTyping = true
+
+    /**
+     * Subscribes only to the events the current setting needs. Every subscribed type makes
+     * every app on the phone generate and send those events, so this matters for battery.
+     */
+    private fun configureEvents() {
+        onlyWhenTyping = settings.showOnlyWhenTyping
+        val info = serviceInfo ?: return
+        info.eventTypes = eventTypesFor(onlyWhenTyping, android.os.Build.VERSION.SDK_INT)
+        serviceInfo = info
+    }
+
+    /** Called from settings when the show-only-when-typing option changes. */
+    fun refreshVisibility() = handler.post {
+        configureEvents()
+        typing.imeVisible = queryImeVisible()
+        applyVisibility(computeTypingState())
+    }
     override fun onInterrupt() {}
 
     override fun onDestroy() {
         instance = null
+        try { unregisterReceiver(unlockReceiver) } catch (_: IllegalArgumentException) {}
+        session++
+        state = State.IDLE
+        currentJob?.cancel()
+        currentJob = null
+        releaseRecorder()
+        pcmStream = null
+        liveSession?.cancel()
+        liveSession = null
+        stopPulse() // an infinite animator would keep requesting frames after the views are gone
         removeOverlay()
+        thread { engine.unloadLocalModel() }
         super.onDestroy()
     }
 
-    private fun initLocalModel() {
-        val modelName = prefs().getString("model_name", "") ?: ""
-        if (modelName.isBlank()) {
-            // Auto-detect first available model
-            val models = LocalTranscriber.availableModels(this)
-            if (models.isNotEmpty()) {
-                Log.i(TAG, "Auto-detected model: ${models.first()}")
-                localTranscriber = LocalTranscriber.create(this, models.first())
-            }
-        } else {
-            localTranscriber = LocalTranscriber.create(this, modelName)
-        }
-        if (localTranscriber != null) {
-            Log.i(TAG, "Local transcription ready")
-        } else {
-            Log.i(TAG, "No local model found, will use API")
+    /** Called from MainActivity when the model or mode changes. */
+    fun reloadModel() {
+        thread {
+            engine.unloadLocalModel()
+            if (settings.mode == TranscriptionMode.LOCAL_ONLY) engine.obtainLocalModel()
         }
     }
-
-    /** Reload local model (called from MainActivity when settings change) */
-    fun reloadModel() { thread { initLocalModel() } }
 
     // --- Overlay ---
 
@@ -152,25 +355,39 @@ class WhisperAccessibilityService : AccessibilityService() {
 
         var startX = 0; var startY = 0
         var touchX = 0f; var touchY = 0f
+        var longPressed = false
+        val longPress = Runnable {
+            if (state == State.IDLE) {
+                longPressed = true
+                overlay.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+                showQuickHistory()
+            }
+        }
 
         overlay.setOnTouchListener { v, ev ->
             when (ev.action) {
                 MotionEvent.ACTION_DOWN -> {
                     startX = params.x; startY = params.y
                     touchX = ev.rawX; touchY = ev.rawY
+                    longPressed = false
+                    handler.postDelayed(longPress, android.view.ViewConfiguration.getLongPressTimeout().toLong())
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
+                    if (abs(ev.rawX - touchX) + abs(ev.rawY - touchY) >= TAP_THRESHOLD_DP * dp) {
+                        handler.removeCallbacks(longPress)
+                    }
+                    if (longPressed) return@setOnTouchListener true
                     params.x = startX + (ev.rawX - touchX).toInt()
                     params.y = startY + (ev.rawY - touchY).toInt()
                     wm.updateViewLayout(v, params)
-                    feedbackLayoutParams?.let {
-                        positionFeedback(it, params)
-                        wm.updateViewLayout(feedbackView, it)
-                    }
+                    moveFeedbackWithBubble()
+                    updatePillPosition()
                     true
                 }
                 MotionEvent.ACTION_UP -> {
+                    handler.removeCallbacks(longPress)
+                    if (longPressed) return@setOnTouchListener true
                     val moved = abs(ev.rawX - touchX) + abs(ev.rawY - touchY)
                     if (moved < TAP_THRESHOLD_DP * dp) {
                         onTap()
@@ -178,13 +395,12 @@ class WhisperAccessibilityService : AccessibilityService() {
                         params.x = if (params.x + ringSize / 2 > screenW / 2)
                             screenW - ringSize - margin else margin
                         wm.updateViewLayout(v, params)
-                        feedbackLayoutParams?.let {
-                            positionFeedback(it, params)
-                            wm.updateViewLayout(feedbackView, it)
-                        }
+                        moveFeedbackWithBubble()
+                        updatePillPosition()
                     }
                     true
                 }
+                MotionEvent.ACTION_CANCEL -> { handler.removeCallbacks(longPress); true }
                 else -> false
             }
         }
@@ -217,9 +433,313 @@ class WhisperAccessibilityService : AccessibilityService() {
         feedbackView = feedback
         layoutParams = params
         feedbackLayoutParams = feedbackParams
+        buildPill(ringSize)
+    }
+
+    /** Keeps the feedback toast next to the bubble. Both are added in [showOverlay]. */
+    private fun moveFeedbackWithBubble() {
+        val view = feedbackView ?: return
+        val fp = feedbackLayoutParams ?: return
+        val bp = layoutParams ?: return
+        positionFeedback(fp, bp)
+        (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(view, fp)
+    }
+
+    private fun buildPill(height: Int) {
+        val btn = (34 * dp).toInt()
+        val iconPad = (8 * dp).toInt()
+        fun roundButton(icon: Int, color: Int, desc: String, onClick: () -> Unit) = ImageView(this).apply {
+            setImageResource(icon)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setPadding(iconPad, iconPad, iconPad, iconPad)
+            background = android.graphics.drawable.RippleDrawable(
+                ColorStateList.valueOf(0x33FFFFFF), circle(color, outline = false), null)
+            contentDescription = desc
+            setOnClickListener { onClick() }
+            layoutParams = android.widget.LinearLayout.LayoutParams(btn, btn)
+        }
+
+        val cancel = roundButton(R.drawable.ic_close, COLOR_CANCEL, "Cancel dictation") { cancelDictation() }
+        val stop = roundButton(R.drawable.ic_check, COLOR_STOP, "Stop and transcribe") { if (state == State.RECORDING) stopAndTranscribe() }
+        val busy = ProgressBar(this).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(0xCCFFFFFF.toInt())
+            visibility = View.GONE
+            layoutParams = android.widget.LinearLayout.LayoutParams((16 * dp).toInt(), (16 * dp).toInt()).apply {
+                marginStart = (12 * dp).toInt()
+            }
+        }
+
+        val wave = WaveformView(this).apply {
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, (22 * dp).toInt(), 1f).apply {
+                marginStart = (8 * dp).toInt(); marginEnd = (6 * dp).toInt()
+            }
+        }
+        val status = TextView(this).apply {
+            textSize = 13f
+            setTextColor(0xFFFFFFFF.toInt())
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            visibility = View.GONE
+            layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = (8 * dp).toInt(); marginEnd = (6 * dp).toInt()
+            }
+        }
+        val timer = TextView(this).apply {
+            textSize = 12f
+            setTextColor(0xBBFFFFFF.toInt())
+            typeface = android.graphics.Typeface.MONOSPACE
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginEnd = (8 * dp).toInt() }
+        }
+
+        val pad = ((height - btn) / 2)
+        val pill = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(pad, pad, pad, pad)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = height / 2f
+                setColor(COLOR_PILL_BG)
+                setStroke(maxOf(1, dp.toInt()), COLOR_OUTLINE) // keeps the pill visible on dark apps
+            }
+            addView(cancel); addView(wave); addView(busy); addView(status); addView(timer); addView(stop)
+        }
+
+        pillParams = WindowManager.LayoutParams(
+            (PILL_W_DP * dp).toInt(), height,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.TOP or Gravity.START }
+        pillView = pill; waveform = wave; pillStatus = status; pillTimer = timer; pillStop = stop; pillBusy = busy
+    }
+
+    /** Places the pill on whichever side of the bubble has room. */
+    private fun updatePillPosition() {
+        val pill = pillView ?: return
+        val pp = pillParams ?: return
+        val bp = layoutParams ?: return
+        val gap = (PILL_GAP_DP * dp).toInt()
+        val bubbleW = bp.width
+        val onRight = bp.x + bubbleW / 2 > screenW / 2
+        pp.x = if (onRight) bp.x - pp.width - gap else bp.x + bubbleW + gap
+        pp.x = pp.x.coerceIn(0, maxOf(0, screenW - pp.width))
+        pp.y = bp.y
+        if (pillShown) (getSystemService(WINDOW_SERVICE) as WindowManager).updateViewLayout(pill, pp)
+    }
+
+    private fun showPillRecording() = handler.post {
+        waveform?.clear()
+        waveform?.visibility = View.VISIBLE
+        pillStatus?.visibility = View.GONE
+        pillBusy?.visibility = View.GONE
+        pillStop?.visibility = View.VISIBLE
+        pillTimer?.visibility = View.VISIBLE
+        pillTimer?.text = "0:00"
+        attachPill()
+        handler.removeCallbacks(tickTimer)
+        handler.post(tickTimer)
+    }
+
+    private fun showPillStatus(text: String) = handler.post {
+        waveform?.visibility = View.GONE
+        pillStatus?.text = text
+        pillStatus?.visibility = View.VISIBLE
+        pillBusy?.visibility = View.VISIBLE
+        pillStop?.visibility = View.GONE
+        pillTimer?.visibility = View.GONE
+        attachPill()
+    }
+
+    private fun attachPill() {
+        val pill = pillView ?: return
+        if (!pillShown) {
+            // Position first: with pillShown still false this only computes the params.
+            // updateViewLayout on a view that isn't added yet throws IllegalArgumentException.
+            updatePillPosition()
+            (getSystemService(WINDOW_SERVICE) as WindowManager).addView(pill, pillParams)
+            pillShown = true
+        }
+    }
+
+    private fun hidePill() = handler.post {
+        handler.removeCallbacks(tickTimer)
+        val pill = pillView ?: return@post
+        if (pillShown) {
+            pillShown = false
+            (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(pill)
+        }
+    }
+
+    // --- Quick history (long-press the bubble) ---
+
+    @VisibleForTesting internal var sheetView: View? = null
+        private set
+
+    private fun isLocked() = (getSystemService(KEYGUARD_SERVICE) as android.app.KeyguardManager).isKeyguardLocked
+
+    private fun showQuickHistory() {
+        if (!settings.historyEnabled) { showFeedback("History is turned off", 1500); return }
+        if (isLocked()) { showFeedback("Unlock to see history", 1500); return }
+        thread {
+            val entries = history.recent(QUICK_HISTORY_COUNT)
+            handler.post { buildQuickHistory(entries) }
+        }
+    }
+
+    private fun dismissQuickHistory() {
+        val sheet = sheetView ?: return
+        (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(sheet)
+        sheetView = null
+        handler.post { if (overlayView != null) applyVisibility(computeTypingState()) }
+    }
+
+    private fun buildQuickHistory(entries: List<HistoryEntry>) {
+        if (overlayView == null || isLocked()) return // service stopped or device locked meanwhile
+        dismissQuickHistory()
+        val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+        val pad = (12 * dp).toInt()
+        val white = 0xFFFFFFFF.toInt()
+        val dim = 0x99FFFFFF.toInt()
+
+        val list = android.widget.LinearLayout(this).apply { orientation = android.widget.LinearLayout.VERTICAL }
+
+        val header = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(pad, pad, pad / 2, pad / 2)
+            addView(TextView(context).apply {
+                text = "Recent dictations"
+                textSize = 14f
+                setTextColor(white)
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+                layoutParams = android.widget.LinearLayout.LayoutParams(0, android.widget.LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            addView(TextView(context).apply {
+                text = "All"
+                textSize = 14f
+                setTextColor(0xFF8AB4F8.toInt())
+                setPadding(pad, pad / 2, pad, pad / 2)
+                setOnClickListener {
+                    dismissQuickHistory()
+                    startActivity(android.content.Intent(context, HistoryActivity::class.java)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                }
+            })
+            addView(TextView(context).apply {
+                text = "✕"
+                textSize = 16f
+                setTextColor(white)
+                setPadding(pad, pad / 2, pad / 2, pad / 2)
+                contentDescription = "Close"
+                setOnClickListener { dismissQuickHistory() }
+            })
+        }
+
+        if (entries.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "Nothing yet. Your dictations will show up here."
+                setTextColor(dim)
+                textSize = 13f
+                setPadding(pad, pad, pad, pad * 2)
+            })
+        }
+        for (e in entries) {
+            val failed = e.status == HistoryEntry.Status.FAILED
+            list.addView(android.widget.LinearLayout(this).apply {
+                orientation = android.widget.LinearLayout.VERTICAL
+                setPadding(pad, pad / 2 + pad / 4, pad, pad / 2 + pad / 4)
+                val outValue = android.util.TypedValue()
+                context.theme.resolveAttribute(android.R.attr.selectableItemBackground, outValue, true)
+                setBackgroundResource(outValue.resourceId)
+                addView(TextView(context).apply {
+                    text = if (failed) "Failed: ${e.error ?: "unknown error"}" else e.text
+                    textSize = 14f
+                    maxLines = 2
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    setTextColor(if (failed) 0xFFFF8A80.toInt() else white)
+                })
+                addView(TextView(context).apply {
+                    val action = if (failed) (if (e.canRetry) "Tap to retry" else "Audio not saved") else "Tap to insert"
+                    text = "${HistoryActions.relativeTime(e.createdAt)} · $action"
+                    textSize = 11f
+                    setTextColor(dim)
+                })
+                setOnClickListener { onQuickHistoryTap(e) }
+            })
+        }
+
+        val scroll = android.widget.ScrollView(this).apply { addView(list) }
+        val sheet = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            background = pill(COLOR_PILL_BG).apply { setStroke(maxOf(1, dp.toInt()), COLOR_OUTLINE) }
+            addView(header)
+            addView(scroll)
+            setOnTouchListener { _, ev ->
+                if (ev.action == MotionEvent.ACTION_OUTSIDE) { dismissQuickHistory(); true } else false
+            }
+        }
+
+        val width = minOf((320 * dp).toInt(), screenW - (2 * MARGIN_DP * dp).toInt())
+        sheet.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        val height = minOf(sheet.measuredHeight, (380 * dp).toInt())
+        val bp = layoutParams
+        val params = WindowManager.LayoutParams(
+            width, height,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (screenW - width) / 2
+            y = ((bp?.y ?: screenH / 2) - height / 2).coerceIn((24 * dp).toInt(), maxOf(0, screenH - height - (24 * dp).toInt()))
+        }
+        wm.addView(sheet, params)
+        sheetView = sheet
+    }
+
+    private fun onQuickHistoryTap(e: HistoryEntry) {
+        dismissQuickHistory()
+        when {
+            isLocked() -> Unit
+            e.status == HistoryEntry.Status.OK && e.text != null -> injectText(e.text, feedback = "Inserted from history")
+            e.canRetry && state == State.IDLE -> retryFromHistory(e)
+            else -> showFeedback("This recording's audio wasn't kept", 2000)
+        }
+    }
+
+    /** Retries a failed entry and types the result into the focused field, like a normal dictation. */
+    private fun retryFromHistory(e: HistoryEntry) {
+        session++
+        val id = session
+        state = State.TRANSCRIBING
+        setAppearance(COLOR_BUSY)
+        setBusy(true)
+        showPillStatus("Retrying…")
+        thread {
+            val job = HistoryActions.retry(this, engine, e) { outcome ->
+                if (id != session) return@retry
+                when (outcome) {
+                    is TranscriptionEngine.Outcome.Success -> finish(id) { injectText(outcome.text, feedback = outcome.note ?: "Retry succeeded") }
+                    is TranscriptionEngine.Outcome.Failure -> finish(id) { showFeedback("Retry failed: ${outcome.error}", 3500) }
+                }
+            }
+            handler.post {
+                if (id != session) { job?.cancel(); return@post }
+                if (job == null) reset("Saved audio is missing")
+                else if (state != State.IDLE) currentJob = job // may already have finished
+            }
+        }
     }
 
     private fun removeOverlay() {
+        dismissQuickHistory()
         val wm = getSystemService(WINDOW_SERVICE) as WindowManager
         overlayView?.let {
             wm.removeView(it)
@@ -229,14 +749,22 @@ class WhisperAccessibilityService : AccessibilityService() {
             wm.removeView(it)
             feedbackView = null
         }
+        handler.removeCallbacks(tickTimer)
+        handler.removeCallbacks(evaluateVisibility)
+        handler.removeCallbacks(hideBubbleNow)
+        handler.removeCallbacks(keyboardTimeout)
+        if (pillShown) pillView?.let { wm.removeView(it) }
+        pillShown = false
+        pillView = null
         button = null
         spinner = null
         layoutParams = null
         feedbackLayoutParams = null
     }
 
-    private fun circle(color: Int) = GradientDrawable().apply {
+    private fun circle(color: Int, outline: Boolean = true) = GradientDrawable().apply {
         shape = GradientDrawable.OVAL; setColor(color)
+        if (outline) setStroke(maxOf(1, dp.toInt()), COLOR_OUTLINE)
     }
 
     private fun pill(color: Int) = GradientDrawable().apply {
@@ -285,18 +813,25 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
     }
 
+    private var pulse: android.animation.ObjectAnimator? = null
+
     private fun startPulse() {
-        button?.let {
-            it.animate().alpha(0.4f).setDuration(500).withEndAction {
-                it.animate().alpha(1f).setDuration(500).withEndAction {
-                    if (state == State.RECORDING) startPulse()
-                }.start()
-            }.start()
+        stopPulse()
+        // One repeating animator. Chaining end actions would spin the main thread when the
+        // user has turned animations off, since each animation then ends immediately.
+        if (!android.animation.ValueAnimator.areAnimatorsEnabled()) return
+        val b = button ?: return
+        pulse = android.animation.ObjectAnimator.ofFloat(b, View.ALPHA, 1f, 0.4f).apply {
+            duration = 500
+            repeatCount = android.animation.ValueAnimator.INFINITE
+            repeatMode = android.animation.ValueAnimator.REVERSE
+            start()
         }
     }
 
     private fun stopPulse() {
-        button?.animate()?.cancel()
+        pulse?.cancel()
+        pulse = null
         button?.alpha = 1f
     }
 
@@ -319,25 +854,55 @@ class WhisperAccessibilityService : AccessibilityService() {
         val bufSize = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
+        if (bufSize <= 0) { toast("Microphone unavailable"); return }
         audioRecord = try {
             AudioRecord(
                 MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize
             )
         } catch (_: SecurityException) { toast("Audio permission denied"); return }
+        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            audioRecord?.release(); audioRecord = null
+            toast("Microphone unavailable"); return
+        }
 
-        pcmStream = ByteArrayOutputStream()
-        audioRecord!!.startRecording()
+        session++
+        // On 13+ the input-method hook already knows the app; skip fetching the view tree.
+        targetPackage = typing.activeInputPackage
+            ?: rootInActiveWindow?.let { root -> root.packageName?.toString().also { root.recycle() } }
+        val stream = ByteArrayOutputStream()
+        pcmStream = stream
+        val recorder = audioRecord!!
+        try { recorder.startRecording() } catch (e: IllegalStateException) {
+            releaseRecorder(); pcmStream = null
+            toast("Microphone busy"); return
+        }
+        handler.removeCallbacks(hideBubbleNow)
+        if (settings.mode != TranscriptionMode.LOCAL_ONLY) TranscriberClient.warmUp(settings.baseUrl)
+        // Live transcription: audio is sent while the user speaks, so text is ready on stop.
+        val live = engine.startLive()
+        liveSession = live
         state = State.RECORDING
+        recordStartMs = System.currentTimeMillis()
         setBusy(false)
         setAppearance(COLOR_RECORDING)
         startPulse()
+        showPillRecording()
 
         thread {
             val buf = ByteArray(bufSize)
             while (state == State.RECORDING) {
-                val n = audioRecord?.read(buf, 0, buf.size) ?: break
-                if (n > 0) pcmStream?.write(buf, 0, n)
+                val n = try { recorder.read(buf, 0, buf.size) } catch (_: IllegalStateException) { break }
+                if (n < 0) break // recorder stopped/released or errored
+                if (n == 0) continue
+                stream.write(buf, 0, n)
+                live?.push(buf, n)
+                if (stream.size() >= MAX_RECORDING_BYTES) {
+                    handler.post { if (state == State.RECORDING && pcmStream === stream) { showFeedback("Max length reached", 1500); stopAndTranscribe() } }
+                    break
+                }
+                val level = AudioLevel.levelOf(buf, n)
+                handler.post { waveform?.push(level) }
             }
         }
     }
@@ -348,128 +913,96 @@ class WhisperAccessibilityService : AccessibilityService() {
         setAppearance(COLOR_BUSY)
         setBusy(true)
 
-        audioRecord?.stop()
-        audioRecord?.release()
-        audioRecord = null
+        releaseRecorder()
 
         val pcm = pcmStream?.toByteArray() ?: ByteArray(0)
         pcmStream = null
 
-        if (pcm.isEmpty()) { reset("No audio captured"); return }
+        if (pcm.isEmpty()) { liveSession?.cancel(); liveSession = null; reset("No audio captured"); return }
+        showPillStatus("Transcribing…")
 
-        val useLocal = prefs().getBoolean("use_local", true)
-        val local = localTranscriber
-
-        if (useLocal && local != null) {
-            transcribeLocal(pcm, local)
-        } else {
-            transcribeApi(pcm)
-        }
-    }
-
-    private fun transcribeLocal(pcm: ByteArray, transcriber: LocalTranscriber) {
-        thread {
-            try {
-                // Convert 16-bit PCM bytes to float samples
-                val samples = FloatArray(pcm.size / 2)
-                for (i in samples.indices) {
-                    val lo = pcm[i * 2].toInt() and 0xFF
-                    val hi = pcm[i * 2 + 1].toInt()
-                    samples[i] = ((hi shl 8) or lo).toShort().toFloat() / 32768f
-                }
-
-                val t0 = System.currentTimeMillis()
-                val text = transcriber.transcribe(samples, SAMPLE_RATE)
-                val ms = System.currentTimeMillis() - t0
-                Log.i(TAG, "Local transcription: ${ms}ms, ${samples.size / SAMPLE_RATE}s audio")
-
-                handleTranscriptionResult(text)
-            } catch (e: Exception) {
-                Log.e(TAG, "Local transcription failed", e)
-                handler.post {
-                    toast("Local error: ${e.message}")
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
-            }
-        }
-    }
-
-    private fun transcribeApi(pcm: ByteArray) {
-        val wav = WavWriter.encode(pcm)
-        val apiKey = prefs().getString("api_key", "") ?: ""
-        if (apiKey.isBlank()) { reset("Set API key in Phone Whisper app"); return }
-
-        TranscriberClient.transcribe(wav, apiKey) { result ->
-            if (result.text != null && result.text.isNotBlank()) {
-                handleTranscriptionResult(result.text)
-            } else {
-                handler.post {
-                    toast("Error: ${result.error ?: "empty transcript"}")
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
-            }
-        }
-    }
-
-    private fun handleTranscriptionResult(text: String?) {
-        if (text.isNullOrBlank()) {
-            handler.post {
-                toast("No speech detected")
-                state = State.IDLE
-                setBusy(false)
-                setAppearance(COLOR_IDLE)
-            }
-            return
-        }
-
-        val usePostProcessing = prefs().getBoolean("use_post_processing", false)
-        val apiKey = prefs().getString("api_key", "") ?: ""
-
-        if (usePostProcessing) {
-            if (apiKey.isBlank()) {
-                handler.post {
-                    toast("Post-processing needs API key. Using raw text.")
-                    injectText(text)
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
-                }
-                return
-            }
-
-            val prompt = prefs().getString("post_processing_prompt", PostProcessor.DEFAULT_PROMPT) ?: PostProcessor.DEFAULT_PROMPT
-            
-            PostProcessor.process(text, prompt, apiKey) { result ->
-                handler.post {
-                    if (result.text != null && result.text.isNotBlank()) {
-                        injectText(result.text)
-                    } else {
-                        injectText(text, feedback = "Cleanup failed — raw copied to clipboard", feedbackDurationMs = 3000)
+        val id = session
+        val target = targetPackage
+        val live = liveSession
+        liveSession = null
+        currentJob = engine.run(pcm, live, onStatus = { if (id == session) showPillStatus(it) }) { outcome ->
+            if (id != session) return@run
+            when (outcome) {
+                is TranscriptionEngine.Outcome.Success -> {
+                    if (settings.historyEnabled && id == session) safely("save history") {
+                        history.addSuccess(outcome.text, outcome.rawText, outcome.source.label, target, HistoryPolicy.durationMs(pcm.size))
                     }
-                    state = State.IDLE
-                    setBusy(false)
-                    setAppearance(COLOR_IDLE)
+                    val prefix = if (outcome.source == TranscriptionEngine.Source.LOCAL_FALLBACK) "Offline — used local model. " else ""
+                    val msg = prefix + (outcome.note ?: "Copied to clipboard")
+                    finish(id) { injectText(outcome.text, feedback = msg, feedbackDurationMs = if (outcome.note != null) 3000 else 2000) }
                 }
-            }
-        } else {
-            handler.post {
-                injectText(text)
-                state = State.IDLE
-                setBusy(false)
-                setAppearance(COLOR_IDLE)
+                is TranscriptionEngine.Outcome.Failure -> {
+                    // Keep the audio so the dictation isn't lost; it can be retried from history.
+                    val saved = settings.historyEnabled && id == session &&
+                        HistoryPolicy.durationMs(pcm.size) >= HistoryPolicy.MIN_FAILED_AUDIO_MS &&
+                        safely("save failed recording") { history.addFailure(outcome.error, pcm, target) }
+                    val msg = if (saved) "${outcome.error} — saved to history, retry from there" else outcome.error
+                    finish(id) { showFeedback(msg, 3500) }
+                }
             }
         }
     }
+
+    /** Runs [action] on the main thread and returns to idle, unless the session was cancelled. */
+    private fun finish(id: Int, action: () -> Unit) {
+        handler.post {
+            if (id != session) return@post
+            currentJob = null
+            action()
+            state = State.IDLE
+            setBusy(false)
+            setAppearance(COLOR_IDLE)
+            hidePill()
+            applyVisibility(computeTypingState())
+        }
+    }
+
+    /** Discards the current recording or transcription. Nothing is typed or copied. */
+    private fun cancelDictation() {
+        if (state == State.IDLE) return
+        session++ // late results from the cancelled session are ignored
+        liveSession?.cancel()
+        liveSession = null
+        currentJob?.cancel()
+        currentJob = null
+        state = State.IDLE
+        releaseRecorder()
+        pcmStream = null
+        stopPulse()
+        setBusy(false)
+        setAppearance(COLOR_IDLE)
+        hidePill()
+        showFeedback("Cancelled", 1200)
+        applyVisibility(computeTypingState())
+    }
+
+    /** Runs a history write; a full disk or DB error must never take down dictation. */
+    private inline fun safely(what: String, block: () -> Unit): Boolean = try {
+        block(); true
+    } catch (e: Exception) {
+        Diagnostics.error(TAG, "Failed to $what", e); false
+    }
+
+    private fun releaseRecorder() {
+        val r = audioRecord ?: return
+        audioRecord = null
+        try { r.stop() } catch (_: IllegalStateException) {}
+        r.release()
+    }
+
 
     private fun reset(msg: String) {
         toast(msg)
         state = State.IDLE
         setBusy(false)
         setAppearance(COLOR_IDLE)
+        hidePill()
+        handler.post { applyVisibility(computeTypingState()) }
     }
 
     // --- Text injection ---
@@ -482,6 +1015,8 @@ class WhisperAccessibilityService : AccessibilityService() {
         val clip = ClipData.newPlainText("phonewhisper", text)
         (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(clip)
         feedback?.let { showFeedback(it, feedbackDurationMs) }
+
+        if (commitViaInputMethod(text)) return
 
         val candidates = findInjectionCandidates()
         Log.i(TAG, "Injecting text into ${candidates.size} candidate node(s)")
@@ -499,6 +1034,26 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
 
         Log.i(TAG, if (injected) "Text injection action reported success" else "No injection action succeeded; clipboard fallback only")
+    }
+
+    /**
+     * Android 13+: types straight into the focused field through the accessibility input
+     * connection, like a keyboard would. No tree walk and no paste. Returns false when no
+     * editor has input, so the node-based fallback runs.
+     */
+    private fun commitViaInputMethod(text: String): Boolean {
+        if (android.os.Build.VERSION.SDK_INT < 33) return false
+        val pkg = typing.activeInputPackage ?: return false
+        if (pkg == packageName) return false
+        val connection = inputMethod?.currentInputConnection ?: return false
+        return try {
+            connection.commitText(text, 1, null)
+            Log.i(TAG, "Committed text through the input connection ($pkg)")
+            true
+        } catch (e: Exception) {
+            Diagnostics.warn(TAG, "commitText failed, falling back to paste", e)
+            false
+        }
     }
 
     private fun findInjectionCandidates(): List<AccessibilityNodeInfo> {
@@ -619,10 +1174,12 @@ class WhisperAccessibilityService : AccessibilityService() {
         }
         Log.i(
             TAG,
-            "$prefix package=${node.packageName} class=${node.className} focused=${node.isFocused} editable=${node.isEditable} text=${node.text} desc=${node.contentDescription} actions=[$actions]"
+            "$prefix package=${node.packageName} class=${node.className} focused=${node.isFocused} editable=${node.isEditable} textLen=${node.text?.length ?: 0} actions=[$actions]"
         )
     }
 
-    private fun prefs() = getSharedPreferences("phonewhisper", MODE_PRIVATE)
-    private fun toast(msg: String) { handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() } }
+    private fun toast(msg: String) {
+        Diagnostics.warn(TAG, msg) // every toast here reports a problem
+        handler.post { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
+    }
 }

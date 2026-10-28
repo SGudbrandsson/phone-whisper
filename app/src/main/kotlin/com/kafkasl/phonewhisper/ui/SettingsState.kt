@@ -1,0 +1,124 @@
+package com.kafkasl.phonewhisper.ui
+
+import com.kafkasl.phonewhisper.RemoteModel
+import com.kafkasl.phonewhisper.TranscriptionMode
+
+data class LocalModelUi(
+    val archive: String,
+    val name: String,
+    val detail: String,
+    val installed: Boolean,
+    val selected: Boolean,
+    /** 0..1 while downloading, -1 while extracting, null when idle. */
+    val progress: Float? = null,
+    val error: String? = null,
+)
+
+/** How dictation is transcribed. Maps onto TranscriptionMode + the live switch. */
+enum class EngineChoice(val title: String, val detail: String) {
+    LIVE("Live", "ElevenLabs Realtime. Text is ready the moment you stop"),
+    UPLOAD("Upload", "Sends the recording when you stop. OpenAI, Groq, LiteLLM or your own server"),
+    ON_DEVICE("On device", "Private and works offline. Slower, English-only models except Whisper Turbo"),
+}
+
+enum class PickerTarget(val title: String) { TRANSCRIPTION("Transcription model"), CLEANUP("Cleanup model") }
+
+data class PickerUi(
+    val target: PickerTarget,
+    val current: String,
+    val models: List<RemoteModel>,
+    val loading: Boolean,
+    val error: String? = null,
+)
+
+data class ServicePreset(val name: String, val baseUrl: String, val sttModel: String, val chatModel: String)
+
+enum class PromptPreset(val title: String, val subtitle: String) {
+    DEV("Dev cleanup", "Coding, CLI and project names"),
+    SIMPLE("Simple cleanup", "Grammar, punctuation, light cleanup"),
+    CUSTOM("Custom", "Your own prompt"),
+}
+
+/** Everything the settings screen shows. Built by [SettingsViewModel], faked in screenshot tests. */
+data class SettingsUiState(
+    val micGranted: Boolean = false,
+    val accessibilityOn: Boolean = false,
+    val engineReady: Boolean = false,
+    val engineDetail: String = "",
+    val offlineHint: String? = null,
+    val crashed: Boolean = false,
+    val showOnlyWhenTyping: Boolean = true,
+    val mode: TranscriptionMode = TranscriptionMode.CLOUD_WITH_FALLBACK,
+    val language: String = "",
+    val serviceName: String = "OpenAI",
+    val baseUrl: String = "",
+    /** "••••abcd" or null when no key is stored. */
+    val apiKeyHint: String? = null,
+    val sttModel: String = "",
+    val connection: String? = null,
+    val connectionOk: Boolean? = null,
+    val testing: Boolean = false,
+    val localModels: List<LocalModelUi> = emptyList(),
+    val cleanupOn: Boolean = false,
+    val prompt: PromptPreset = PromptPreset.DEV,
+    val customPrompt: String = "",
+    val chatModel: String = "",
+    val historyOn: Boolean = true,
+    val retentionDays: Int = 7,
+    val picker: PickerUi? = null,
+    val version: String = "",
+    val vocabCount: Int = 0,
+    val vocabHints: Boolean = true,
+    val liveOn: Boolean = true,
+    /** "••••abcd" or null when no ElevenLabs key is stored. */
+    val elevenKeyHint: String? = null,
+    val liveTest: String? = null,
+    val liveTestOk: Boolean? = null,
+    val liveTesting: Boolean = false,
+    val compressAudio: Boolean = true,
+    val engine: EngineChoice = EngineChoice.UPLOAD,
+    val offlineFallback: Boolean = true,
+    val removeFillers: Boolean = true,
+) {
+    val ready get() = micGranted && accessibilityOn && engineReady
+    val usesCloud get() = mode != TranscriptionMode.LOCAL_ONLY
+    /** The upload endpoint matters for Upload, as Live's backup, and for cleanup. */
+    val showCloud get() = usesCloud || cleanupOn
+    val showLocal get() = engine == EngineChoice.ON_DEVICE || offlineFallback
+}
+
+sealed interface SettingsEvent {
+    data object GrantMic : SettingsEvent
+    data object OpenAccessibility : SettingsEvent
+    data object ViewCrash : SettingsEvent
+    data object DismissCrash : SettingsEvent
+    data class SetOnlyWhenTyping(val on: Boolean) : SettingsEvent
+    data class SetMode(val mode: TranscriptionMode) : SettingsEvent
+    data class SetLanguage(val code: String) : SettingsEvent
+    data class ChooseService(val preset: ServicePreset) : SettingsEvent
+    data class SetCustomUrl(val url: String) : SettingsEvent
+    data class SetApiKey(val key: String) : SettingsEvent
+    data object TestConnection : SettingsEvent
+    data class OpenPicker(val target: PickerTarget) : SettingsEvent
+    data object RefreshPicker : SettingsEvent
+    data object ClosePicker : SettingsEvent
+    data class PickModel(val target: PickerTarget, val id: String) : SettingsEvent
+    data class LocalModelTap(val archive: String) : SettingsEvent
+    data class DeleteLocalModel(val archive: String) : SettingsEvent
+    data class SetCleanup(val on: Boolean) : SettingsEvent
+    data class SetPrompt(val preset: PromptPreset) : SettingsEvent
+    data class SetCustomPrompt(val text: String) : SettingsEvent
+    data class SetHistory(val on: Boolean) : SettingsEvent
+    data class SetRetention(val days: Int) : SettingsEvent
+    data object ClearHistory : SettingsEvent
+    data object OpenHistory : SettingsEvent
+    data object OpenDiagnostics : SettingsEvent
+    data object OpenDictionary : SettingsEvent
+    data class SetLive(val on: Boolean) : SettingsEvent
+    data class SetElevenKey(val key: String) : SettingsEvent
+    data object TestLive : SettingsEvent
+    data class SetCompress(val on: Boolean) : SettingsEvent
+    data class SetEngine(val engine: EngineChoice) : SettingsEvent
+    data class SetOfflineFallback(val on: Boolean) : SettingsEvent
+    data class SetRemoveFillers(val on: Boolean) : SettingsEvent
+}

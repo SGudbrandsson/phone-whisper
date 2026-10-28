@@ -25,6 +25,8 @@ val MODEL_CATALOG = listOf(
         465, "★★★★ Best quality"),
     Model("Moonshine Tiny", "sherpa-onnx-moonshine-tiny-en-int8",
         103, "★★☆ Fast"),
+    Model("Whisper Turbo (multilingual)", "sherpa-onnx-whisper-turbo",
+        564, "★★★★ Icelandic + 90 languages · slow, ~1 GB on disk"),
 )
 
 sealed class DownloadState {
@@ -57,6 +59,7 @@ object ModelDownloader {
                 downloadFile(url, tmpFile, onState)
                 onState(DownloadState.Extracting)
                 extractTarBz2(tmpFile, outDir)
+                LocalTranscriber.pruneUnusedFloatModels(modelDir(ctx, model))
                 onState(DownloadState.Done)
             } catch (e: Exception) {
                 onState(DownloadState.Error(e.message ?: "Unknown error"))
